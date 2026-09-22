@@ -14,7 +14,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { emitToMeeting } from "@/lib/socket-emitters";
+import { emitToMeeting } from "@/lib/livekit-emitters";
 
 export const runtime = "nodejs";
 

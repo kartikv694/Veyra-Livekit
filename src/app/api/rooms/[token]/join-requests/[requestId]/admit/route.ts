@@ -1,8 +1,12 @@
 /**
  * Host-only. Admits a waiting join request — creates the Participant
- * row (same shape as a normal join) and tells the waiting person's
- * lobby to proceed, via the "join-request:resolved" push their polling
- * also picks up as a fallback if the push is missed.
+ * row (same shape as a normal join). The waiting person finds out via
+ * their own polling of GET /api/rooms/[token]/join-requests/mine (every
+ * 3 seconds — see the polling effect in room/[token]/page.tsx), not a
+ * push: they aren't a LiveKit room participant yet at this point, so
+ * there's no delivery channel to push to even if there were an instant
+ * one to use. A 3-second worst-case delay isn't worth the complexity a
+ * push would add here.
  *
  * Responses:
  *   200  { admitted: userId }
@@ -13,7 +17,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { emitToUser } from "@/lib/socket-emitters";
 
 export const runtime = "nodejs";
 
@@ -51,8 +54,6 @@ export async function POST(
       create: { meetingId: meeting.id, userId: request.userId },
     }),
   ]);
-
-  emitToUser(meeting.token, request.userId, "join-request:resolved", { admitted: true });
 
   return NextResponse.json({ admitted: request.userId });
 }

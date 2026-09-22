@@ -9,7 +9,6 @@ import {
   Copy,
   Droplets,
   Grid3X3,
-  Info,
   KeyRound,
   Lock,
   LockOpen,
@@ -35,7 +34,8 @@ import { ControlBar } from "@/components/ControlBar";
 import { ParticipantList, type ParticipantRow } from "@/components/ParticipantList";
 import { LoadingScreen } from "@/components/LoadingScreen";
 import { checkAuth, authHeaders, type SessionUser } from "@/lib/auth-client";
-import { useMeetingRoom } from "@/hooks/useMeetingRoom";
+import { useMeetingRoom, type RemotePeer } from "@/hooks/useMeetingRoom";
+import { useLiveKitRoom } from "@/hooks/useLiveKitRoom";
 
 /**
  * The Web Speech API's SpeechRecognition isn't part of TypeScript's
@@ -256,6 +256,7 @@ function ReadyMeetingCard({
 
 function MeetingPanel({
   panel,
+  token,
   participants,
   viewerIsHost,
   onClose,
@@ -289,6 +290,7 @@ function MeetingPanel({
   onChangeBackgroundEffect,
 }: {
   panel: Panel;
+  token: string;
   participants: ParticipantRow[];
   viewerIsHost: boolean;
   onClose: () => void;
@@ -328,6 +330,7 @@ function MeetingPanel({
       {panel === "people" && (
         <ParticipantList
           open
+          token={token}
           participants={participants}
           onClose={onClose}
           viewerIsHost={viewerIsHost}
@@ -535,6 +538,12 @@ export default function RoomPage() {
   const [me, setMe] = useState<SessionUser | null>(null);
   const [participants, setParticipants] = useState<ParticipantRow[]>([]);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  // Returned by the join endpoint (null if LiveKit isn't configured on the
+  // server, in which case media falls back to the legacy WebRTC mesh).
+  // Only ever set together with `joined`, so nothing publishes into the
+  // LiveKit room while still in the lobby / waiting to be admitted.
+  const [livekitUrl, setLivekitUrl] = useState<string | null>(null);
+  const [livekitToken, setLivekitToken] = useState<string | null>(null);
   // Remembers the last mic/camera toggle across a refresh — without this,
   // reloading the page always re-acquires the camera/mic as "on" by
   // default (that's just what getUserMedia gives you), ignoring that the
@@ -736,14 +745,27 @@ export default function RoomPage() {
         console.error("[Veyra] Failed to load chat history", err);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joined, token]);
 
+  const livekitActive = Boolean(livekitUrl && livekitToken);
   const {
-    peers,
+    connected: livekitConnected,
+    connectError: livekitError,
+    peers: livekitPeers,
+    publishLocalStream,
+    setLocalMuted,
+    replaceCameraTrack,
+    publishScreenShare,
+    unpublishScreenShare,
+    sendData: livekitSendData,
+    room: livekitRoomInstance,
+  } = useLiveKitRoom(livekitUrl, livekitToken);
+
+  const {
+    peers: socketPeers,
+    handRaisedByUserId,
     connected,
     broadcastMediaState,
-    emitHostControl,
     addScreenShareTrack,
     removeScreenShareTrack,
     broadcastScreenShareState,
@@ -834,7 +856,77 @@ export default function RoomPage() {
       },
     },
     joined,
+    // Media rides on LiveKit whenever the server gave us a token; the
+    // mesh is only the fallback for a deployment without LiveKit set up.
+    !livekitActive,
+    // Host-control events (mute/remove/camera-off, single or bulk, plus
+    // meeting:ended) now ride LiveKit's data channel instead of the
+    // socket when it's connected — see handleHostEvent in
+    // useMeetingRoom.ts. Passing this even while !livekitConnected is
+    // fine: the effect that attaches the listener just no-ops until it's
+    // non-null.
+    livekitRoomInstance,
   );
+
+  // What the tiles consume: the socket roster (mic/camera/hand-raise/host
+  // state) with each person's streams taken from LiveKit when it's in
+  // charge of media. Same RemotePeer shape as before, so nothing
+  // downstream had to change.
+  const peers = useMemo<RemotePeer[]>(() => {
+    if (!livekitActive) return socketPeers;
+    // Structure (who exists, mic/camera on/off, streams) now comes from
+    // LiveKit's own native participant + mute tracking, not the socket's
+    // room:peers/peer:joined/peer:left/peer:media-state — those events
+    // update socketPeers just as before, but socketPeers is no longer
+    // the base here. handRaisedByUserId is genuinely decoupled from
+    // socketPeers' own population (see its own comment in
+    // useMeetingRoom.ts) — this doesn't depend on peer:joined having
+    // created an entry there first.
+    const participantsByUserId = new Map(participants.map((p) => [p.userId, p]));
+    return livekitPeers.map((media) => {
+      const dbInfo = participantsByUserId.get(media.userId);
+      return {
+        socketId: `lk-${media.userId}`,
+        userId: media.userId,
+        name: dbInfo?.name ?? media.name,
+        stream: media.cameraActive ? media.cameraStream : null,
+        screenStream: media.screenActive ? media.screenStream : null,
+        cameraTrackId: null,
+        cameraAudioTrackId: null,
+        micOn: media.micEnabled,
+        cameraOn: media.cameraEnabled,
+        handRaised: handRaisedByUserId[media.userId] ?? false,
+        isHost: dbInfo?.isHost ?? false,
+        isMuted: dbInfo?.isMuted ?? false,
+        isCameraOff: dbInfo?.isCameraOff ?? false,
+      };
+    });
+  }, [livekitActive, socketPeers, livekitPeers, participants, handRaisedByUserId]);
+
+  // Publish the lobby's own camera/mic tracks into the LiveKit room once
+  // connected. micOn/cameraOn are read only for the INITIAL muted state
+  // (so someone who joins with the camera off never flashes a frame);
+  // later toggles are mirrored by the effect below.
+  useEffect(() => {
+    if (!livekitActive || !livekitConnected || !localStream) return;
+    void publishLocalStream(localStream, { audio: !micOn, video: !cameraOn });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [livekitActive, livekitConnected, localStream, publishLocalStream]);
+
+  // Every mic/camera change — the user's own toggle, a host force-mute,
+  // a remembered "off" preference — already lands in micOn/cameraOn, so
+  // this one effect keeps LiveKit's muted state in step with all of them.
+  useEffect(() => {
+    if (!livekitActive || !livekitConnected) return;
+    void setLocalMuted("audio", !micOn);
+    void setLocalMuted("video", !cameraOn);
+  }, [livekitActive, livekitConnected, micOn, cameraOn, setLocalMuted]);
+
+  useEffect(() => {
+    if (livekitError) {
+      toast.error("Couldn't connect to the video server. Others may not see or hear you — try refreshing the page.");
+    }
+  }, [livekitError]);
 
   /**
    * What the lobby's "Join now" button actually does: calls the real join
@@ -892,6 +984,8 @@ export default function RoomPage() {
         setShowReadyCard(true);
         window.history.replaceState({}, "", window.location.pathname);
       }
+      setLivekitUrl(typeof data.livekitUrl === "string" ? data.livekitUrl : null);
+      setLivekitToken(typeof data.livekitToken === "string" ? data.livekitToken : null);
       setJoined(true);
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -935,6 +1029,8 @@ export default function RoomPage() {
               setLocked(Boolean(joinedData.meeting.locked));
               setPasscodeSet(Boolean(joinedData.meeting.passcodeSet));
             }
+            setLivekitUrl(typeof joinedData.livekitUrl === "string" ? joinedData.livekitUrl : null);
+            setLivekitToken(typeof joinedData.livekitToken === "string" ? joinedData.livekitToken : null);
             setJoined(true);
           }
         } else if (data.status === "DENIED") {
@@ -1094,7 +1190,11 @@ export default function RoomPage() {
     stream.getAudioTracks().forEach((track) => (track.enabled = next));
     setMicOn(next);
     window.localStorage.setItem("veyra:mic-pref", next ? "on" : "off");
-    broadcastMediaState(next, cameraOn);
+    // LiveKit's own TrackMuted/TrackUnmuted already carries this to
+    // everyone natively (see setLocalMuted below and useLiveKitRoom's
+    // mute-state tracking) — this broadcast is only needed as the mesh
+    // fallback's own signal now.
+    if (!livekitActive) broadcastMediaState(next, cameraOn);
   };
 
   const toggleCamera = () => {
@@ -1108,7 +1208,17 @@ export default function RoomPage() {
     stream.getVideoTracks().forEach((track) => (track.enabled = next));
     setCameraOn(next);
     window.localStorage.setItem("veyra:camera-pref", next ? "on" : "off");
-    broadcastMediaState(micOn, next);
+    if (!livekitActive) broadcastMediaState(micOn, next);
+  };
+
+  // Sends the new camera track to everyone: one LiveKit replaceTrack when
+  // LiveKit carries media, otherwise the mesh's per-connection swap.
+  // Resolves once the swap has actually happened, so the processor being
+  // replaced is only stopped after that (see the "none" branch below).
+  const swapOutgoingCameraTrack = (oldTrack: MediaStreamTrack, newTrack: MediaStreamTrack): Promise<unknown> => {
+    if (livekitActive) return replaceCameraTrack(newTrack);
+    replaceLocalVideoTrack(oldTrack, newTrack);
+    return Promise.resolve();
   };
 
   /**
@@ -1121,7 +1231,8 @@ export default function RoomPage() {
    * Every switch that actually changes which track is live updates three
    * things together: localStream itself (so the local preview picks it
    * up — VideoTile's addtrack listener handles the rest), every current
-   * peer connection (replaceLocalVideoTrack), and activeVideoTrackRef (so
+   * outgoing track (swapOutgoingCameraTrack — LiveKit, or every mesh peer
+   * connection as the fallback), and activeVideoTrackRef (so
    * the next switch knows what it's replacing).
    */
   const applyBackgroundEffect = async (effect: BackgroundEffect) => {
@@ -1138,15 +1249,17 @@ export default function RoomPage() {
       // got a chance to hand it a live one — which is what froze a
       // remote participant's view on the last blurred frame instead of
       // it reverting to the live camera when blur was turned back off.
+      let swapped: Promise<unknown> = Promise.resolve();
       if (currentTrack !== rawTrack) {
         stream.removeTrack(currentTrack);
         stream.addTrack(rawTrack);
-        replaceLocalVideoTrack(currentTrack, rawTrack);
+        swapped = swapOutgoingCameraTrack(currentTrack, rawTrack);
         rawTrack.enabled = cameraOn;
         activeVideoTrackRef.current = rawTrack;
       }
-      bgProcessorRef.current?.stop();
+      const retiring = bgProcessorRef.current;
       bgProcessorRef.current = null;
+      void swapped.finally(() => retiring?.stop());
       setBackgroundEffect(effect);
       return;
     }
@@ -1165,7 +1278,7 @@ export default function RoomPage() {
       if (currentTrack !== processedTrack) {
         stream.removeTrack(currentTrack);
         stream.addTrack(processedTrack);
-        replaceLocalVideoTrack(currentTrack, processedTrack);
+        void swapOutgoingCameraTrack(currentTrack, processedTrack);
         processedTrack.enabled = cameraOn;
         activeVideoTrackRef.current = processedTrack;
       }
@@ -1179,7 +1292,15 @@ export default function RoomPage() {
   const handleToggleHandRaise = () => {
     const next = !handRaised;
     setHandRaised(next);
-    broadcastHandRaise(next);
+    // Own hand-raise state (above) is already a direct local update
+    // regardless of transport, so this only needs to broadcast it to
+    // everyone else — no separate "update my own UI" step needed here
+    // the way handleReact below needs one.
+    if (livekitActive && me) {
+      livekitSendData("peer:hand-raised", { userId: me.id, raised: next });
+    } else {
+      broadcastHandRaise(next);
+    }
     toast.info(next ? "You raised your hand." : "You lowered your hand.");
   };
 
@@ -1320,7 +1441,36 @@ export default function RoomPage() {
     };
   }, []);
 
+  const handleChangeLayoutSettings = (value: number) => {
+    // Updates locally directly, not via the broadcast echoing back —
+    // unlike reactions/hand-raise, this setting previously had NO other
+    // path to update the host's own UI at all (setMaxVisibleTiles was
+    // only ever called from the received-broadcast callback), so
+    // self-filtering a LiveKit-sent copy the way reactions does would
+    // have left the host's own tile-count change never actually apply.
+    setMaxVisibleTiles(value);
+    if (livekitActive) {
+      livekitSendData("meeting:layout-settings", { maxVisibleTiles: value });
+    } else {
+      broadcastLayoutSettings(value);
+    }
+  };
+
   const handleReact = (emoji: string) => {
+    if (livekitActive && me) {
+      // Unlike the socket path (which relies on the server echoing the
+      // reaction back to everyone including the sender — see
+      // server.ts), LiveKit's client-to-client publishData path can't
+      // assume that, so this adds it locally directly. The receiving
+      // listener (useMeetingRoom's handleRealtimeEvent dispatch) filters
+      // out self-originated messages specifically so this can't ever
+      // become a double-add, regardless of whether LiveKit actually
+      // loops a sender's own message back to them or not.
+      const fromName = me.name ?? "Someone";
+      livekitSendData("peer:reaction", { emoji, name: fromName }, { reliable: false });
+      setReactions((prev) => [...prev, { id: Math.random().toString(36).slice(2), emoji, fromName }]);
+      return;
+    }
     // The server echoes reactions back to everyone including the sender
     // (see server.ts), so this alone is enough — no need to also add it
     // locally here, which would show your own reaction twice.
@@ -1346,18 +1496,23 @@ export default function RoomPage() {
     // video element (since their copy of cameraOn said true again)
     // while the actual track stayed disabled — producing a black tile
     // instead of the avatar fallback.
-    if (connected) broadcastMediaState(micOn, cameraOn);
-  }, [peerCount, connected, micOn, cameraOn, broadcastMediaState]);
+    if (!livekitActive && connected) broadcastMediaState(micOn, cameraOn);
+  }, [peerCount, connected, micOn, cameraOn, broadcastMediaState, livekitActive]);
 
   const stopScreenShare = useCallback(() => {
-    const tracks = screenStreamRef.current?.getTracks() ?? [];
-    tracks.forEach((t) => removeScreenShareTrack(t));
+    const display = screenStreamRef.current;
+    const tracks = display?.getTracks() ?? [];
+    if (livekitActive) {
+      if (display) void unpublishScreenShare(display);
+    } else {
+      tracks.forEach((t) => removeScreenShareTrack(t));
+      broadcastScreenShareState(false);
+    }
     tracks.forEach((t) => t.stop());
     screenStreamRef.current = null;
     setSharingScreen(false);
     setScreenStream(null);
-    broadcastScreenShareState(false);
-  }, [removeScreenShareTrack, broadcastScreenShareState]);
+  }, [livekitActive, unpublishScreenShare, removeScreenShareTrack, broadcastScreenShareState]);
 
   const startScreenShare = async () => {
     setShowShareWarning(false);
@@ -1386,14 +1541,18 @@ export default function RoomPage() {
       screenStreamRef.current = display;
       setSharingScreen(true);
       setScreenStream(display);
-      // A genuinely separate sender, not a replacement for the camera
-      // track — this is what makes the screen show up as its own tile
-      // for everyone else (matching Meet), with your camera still
-      // showing normally alongside it, instead of your screen taking
-      // over your camera's slot.
-      addScreenShareTrack(screenTrack, display);
-      if (screenAudioTrack) addScreenShareTrack(screenAudioTrack, display);
-      broadcastScreenShareState(true);
+      // Published as its own screen-share track(s), not a replacement for
+      // the camera track — this is what makes the screen show up as its
+      // own tile for everyone else (matching Meet), with your camera
+      // still showing normally alongside it, instead of your screen
+      // taking over your camera's slot.
+      if (livekitActive) {
+        void publishScreenShare(display);
+      } else {
+        addScreenShareTrack(screenTrack, display);
+        if (screenAudioTrack) addScreenShareTrack(screenAudioTrack, display);
+        broadcastScreenShareState(true);
+      }
       // The browser's own native "Stop sharing" control also needs to revert us.
       screenTrack.onended = stopScreenShare;
       toast.success(screenAudioTrack ? "Sharing your screen, with audio." : "Sharing your screen.");
@@ -1415,6 +1574,10 @@ export default function RoomPage() {
     if (sharingScreen) {
       stopScreenShare();
       toast.info("Stopped sharing your screen.");
+      return;
+    }
+    if (livekitActive && !livekitConnected) {
+      toast.info("Still connecting to the video server — try again in a moment.");
       return;
     }
     // Don't jump straight to the OS picker — warn first. Sharing this
@@ -1454,7 +1617,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't mute that participant.");
       setParticipants((prev) => prev.map((p) => p.userId === data.userId ? { ...p, isMuted: Boolean(data.muted) } : p));
-      emitHostControl("host:mute-participant", { userId: data.userId, muted: Boolean(data.muted) });
       toast.success(data.muted ? "Participant muted." : "Participant unmuted.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1467,7 +1629,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't turn off that participant's camera.");
       setParticipants((prev) => prev.map((p) => p.userId === data.userId ? { ...p, isCameraOff: Boolean(data.cameraOff) } : p));
-      emitHostControl("host:camera-participant", { userId: data.userId, cameraOff: Boolean(data.cameraOff) });
       toast.success(data.cameraOff ? "Camera turned off." : "Camera turned on.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1480,7 +1641,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't mute everyone.");
       setParticipants((prev) => prev.map((p) => p.isHost ? p : { ...p, isMuted: true }));
-      emitHostControl("host:mute-all", { userIds: Array.isArray(data.muted) ? data.muted : [], muted: true });
       toast.success("Muted everyone.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1493,7 +1653,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't unmute everyone.");
       setParticipants((prev) => prev.map((p) => p.isHost ? p : { ...p, isMuted: false }));
-      emitHostControl("host:mute-all", { userIds: Array.isArray(data.unmuted) ? data.unmuted : [], muted: false });
       toast.success("Allowed microphones for everyone.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1506,7 +1665,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't turn off everyone's camera.");
       setParticipants((prev) => prev.map((p) => p.isHost ? p : { ...p, isCameraOff: true }));
-      emitHostControl("host:camera-all", { userIds: Array.isArray(data.camerasOff) ? data.camerasOff : [], cameraOff: true });
       toast.success("Turned off everyone's camera.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1519,7 +1677,6 @@ export default function RoomPage() {
       const data = await res.json();
       if (!res.ok) return toast.error(data.error ?? "Couldn't turn on everyone's camera.");
       setParticipants((prev) => prev.map((p) => p.isHost ? p : { ...p, isCameraOff: false }));
-      emitHostControl("host:camera-all", { userIds: Array.isArray(data.camerasOn) ? data.camerasOn : [], cameraOff: false });
       toast.success("Allowed cameras for everyone.");
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
@@ -1822,7 +1979,7 @@ export default function RoomPage() {
           <span className="text-sm font-medium text-white sm:text-base">{formatTime(now)}</span>
           <span className="text-white/35">|</span>
           <span className="max-w-[180px] truncate text-sm font-medium text-white/85 sm:max-w-none">{meetingTitle || token}</span>
-          <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400" : "bg-amber-400"}`} title={connected ? "Connected" : "Connecting"} />
+          <span className={`h-2 w-2 rounded-full ${(livekitActive ? livekitConnected : connected) ? "bg-emerald-400" : "bg-amber-400"}`} title={(livekitActive ? livekitConnected : connected) ? "Connected" : "Connecting"} />
         </div>
 
         <div className="flex items-center gap-2 sm:gap-3">
@@ -2239,6 +2396,7 @@ export default function RoomPage() {
 
       <MeetingPanel
         panel={panel}
+        token={token}
         participants={participants}
         viewerIsHost={myRow?.isHost ?? false}
         onClose={() => setPanel(null)}
@@ -2261,7 +2419,7 @@ export default function RoomPage() {
         layoutMode={layoutMode}
         onCycleLayout={cycleLayout}
         maxVisibleTiles={maxVisibleTiles}
-        onChangeMaxVisibleTiles={broadcastLayoutSettings}
+        onChangeMaxVisibleTiles={handleChangeLayoutSettings}
         backgroundEffect={backgroundEffect}
         onChangeBackgroundEffect={(effect) => void applyBackgroundEffect(effect)}
         timerRemaining={timerRemaining}

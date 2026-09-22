@@ -17,7 +17,7 @@
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { resolveHostAction } from "@/lib/host-action";
 import { prisma } from "@/lib/prisma";
-import { emitToMeeting } from "@/lib/socket-emitters";
+import { emitToMeeting } from "@/lib/livekit-emitters";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";

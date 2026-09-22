@@ -1,7 +1,10 @@
 /**
- * Host-only. Denies a waiting join request. The person's lobby (via
- * polling, and the "join-request:resolved" push as a fallback) shows
- * that they weren't let in and sends them back to the dashboard.
+ * Host-only. Denies a waiting join request. The person finds out via
+ * their own polling of GET /api/rooms/[token]/join-requests/mine (every
+ * 3 seconds — see the polling effect in room/[token]/page.tsx), same
+ * reasoning as the admit route: they aren't a LiveKit room participant
+ * yet at this point, so there's no push channel to use even if one were
+ * worth adding for a 3-second worst-case delay.
  *
  * Responses:
  *   200  { denied: userId }
@@ -12,7 +15,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { emitToUser } from "@/lib/socket-emitters";
 
 export const runtime = "nodejs";
 
@@ -43,8 +45,6 @@ export async function POST(
     where: { id: request.id },
     data: { status: "DENIED", resolvedAt: new Date() },
   });
-
-  emitToUser(meeting.token, request.userId, "join-request:resolved", { admitted: false });
 
   return NextResponse.json({ denied: request.userId });
 }

@@ -20,6 +20,13 @@ const ThemeContext = createContext<{ theme: Theme; toggle: () => void }>({
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setTheme] = useState<Theme>("light");
 
+  // localStorage/matchMedia are browser-only — this has to be an
+  // effect (not a useState lazy initializer) to avoid a hydration
+  // mismatch between server and client markup, same reasoning as the
+  // ?email=/?reason= mount effects elsewhere in the app. Empty deps
+  // means it runs exactly once, so there's no cascade risk despite the
+  // synchronous setState the linter is generally right to be wary of.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const stored = window.localStorage.getItem("theme") as Theme | null;
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -27,6 +34,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     setTheme(initial);
     document.documentElement.classList.toggle("dark", initial === "dark");
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const toggle = () => {
     setTheme((prev) => {

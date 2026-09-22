@@ -52,7 +52,10 @@ export function UserMenu({ user, variant = "themed" }: UserMenuProps) {
     // mount (via checkAuth()) and never re-checks it afterward, so a soft
     // refresh left it showing the stale logged-in avatar even though the
     // token really had been cleared. A full reload guarantees every
-    // component starts clean.
+    // component starts clean. router.push() (what this lint rule
+    // suggests) is exactly what was tried before and caused that stale
+    // state — not an oversight, so suppressed rather than "fixed".
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = "/";
   };
 

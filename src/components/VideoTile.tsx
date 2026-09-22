@@ -126,8 +126,12 @@ function VideoTile({
   }, [stream, isLocal, attachStream]);
 
   useEffect(() => {
+    // No explicit setSpeaking(false) here for the "nothing to analyze"
+    // case — it's provably redundant, not just omitted: speaking
+    // already defaults to false on mount, and any transition INTO this
+    // branch means a previous effect instance (with valid audio) is
+    // tearing down, whose own cleanup below already resets it.
     if (!stream || isMuted || stream.getAudioTracks().length === 0) {
-      setSpeaking(false);
       return;
     }
 

@@ -42,10 +42,15 @@ export default function MeetingEndedPage() {
   const [secondsLeft, setSecondsLeft] = useState(AUTO_RETURN_SECONDS);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Pick up ?reason= from the redirect that sent someone here — same
+  // "one-off mount read, no Suspense boundary needed, no cascade risk"
+  // reasoning as login/signup's matching ?email= effects.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const value = new URLSearchParams(window.location.search).get("reason");
     if (value === "removed" || value === "ended") setReason(value);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Auto-return countdown — cancelled by cancelAutoReturn() below the
   // instant the person clicks either button, so it never fires after

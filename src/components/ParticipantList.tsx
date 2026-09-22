@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Check, Crown, Mic, MicOff, UserPlus, UserX, Video, VideoOff, X } from "lucide-react";
+import { authHeaders } from "@/lib/auth-client";
 
 export interface ParticipantRow {
   userId: number;
@@ -77,6 +78,7 @@ function ToggleSwitch({
 
 interface ParticipantListProps {
   open: boolean;
+  token: string;
   participants: ParticipantRow[];
   onClose: () => void;
   viewerIsHost: boolean;
@@ -109,6 +111,7 @@ function initials(name: string): string {
 
 export function ParticipantList({
   open,
+  token,
   participants,
   onClose,
   viewerIsHost,
@@ -128,6 +131,73 @@ export function ParticipantList({
   onInvite,
 }: ParticipantListProps) {
   const [showInvite, setShowInvite] = useState(false);
+  // Contact suggestions — same pattern as the dashboard's schedule modal
+  // and the "meeting's ready" card, but self-contained here rather than
+  // shared: this panel and those two are separate components with their
+  // own state, not a common one to lift this into.
+  const [contacts, setContacts] = useState<{ id: number; name: string | null; email: string }[]>([]);
+  const [loadingContacts, setLoadingContacts] = useState(false);
+  const [showContacts, setShowContacts] = useState(false);
+  const [alreadyInvitedEmails, setAlreadyInvitedEmails] = useState<Set<string>>(new Set());
+
+  const inviteEmails = inviteInput.split(/[,\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const currentEmailToken = inviteEmails.length ? inviteEmails[inviteEmails.length - 1] : "";
+  const filteredContacts = currentEmailToken
+    ? contacts.filter(
+        (contact) =>
+          contact.email.toLowerCase().includes(currentEmailToken) ||
+          (contact.name ?? "").toLowerCase().includes(currentEmailToken),
+      )
+    : contacts;
+
+  const loadInvitedEmails = async () => {
+    try {
+      const res = await fetch(`/api/rooms/${token}/invite`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && Array.isArray(data.invites)) {
+        setAlreadyInvitedEmails(new Set(data.invites.map((i: { email: string }) => i.email.toLowerCase())));
+      }
+    } catch {
+      // Non-critical — the checkmark just won't reflect past invites
+      // until the next successful open; inviting itself still works.
+    }
+  };
+
+  const openContacts = async () => {
+    setShowContacts(true);
+    if (contacts.length > 0) {
+      // Already loaded once this panel session — just refresh which
+      // ones are marked invited, no need to re-fetch the contact list
+      // itself every time the field is focused.
+      void loadInvitedEmails();
+      return;
+    }
+    setLoadingContacts(true);
+    try {
+      const [contactsRes] = await Promise.all([fetch("/api/contacts", { headers: authHeaders() }), loadInvitedEmails()]);
+      const data = await contactsRes.json().catch(() => ({}));
+      if (contactsRes.ok) setContacts(data.contacts ?? []);
+    } catch {
+      // Non-critical — the manual input still works without suggestions.
+    } finally {
+      setLoadingContacts(false);
+    }
+  };
+
+  // Re-checks the persisted invite list right after a send succeeds, so
+  // a contact just invited immediately shows the checkmark instead of
+  // waiting for the dropdown to be closed and reopened.
+  const handleInviteAndRefresh = async () => {
+    await onInvite?.();
+    if (showContacts) void loadInvitedEmails();
+  };
+
+  const addContactEmail = (email: string) => {
+    const lower = email.trim().toLowerCase();
+    if (inviteEmails.includes(lower)) return;
+    setInviteInput?.(inviteEmails.length ? `${inviteInput.replace(/[,\s]+$/, "")}, ${lower}` : lower);
+  };
+
   if (!open) return null;
 
   const active = participants.filter((p) => !p.leftAt);
@@ -160,27 +230,63 @@ export function ParticipantList({
             <UserPlus size={14} /> Invite
           </button>
           {showInvite && (
-            <div className="mt-2 flex gap-2">
-              <input
-                autoFocus
-                value={inviteInput}
-                onChange={(e) => setInviteInput?.(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    onInvite?.();
-                  }
-                }}
-                placeholder="name@example.com, another@example.com"
-                className="min-w-0 flex-1 rounded-lg bg-white/5 px-3 py-2 text-sm text-white outline-none placeholder:text-white/30"
-              />
-              <button
-                onClick={() => onInvite?.()}
-                disabled={inviting || !inviteInput.trim()}
-                className="shrink-0 rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
-              >
-                {inviting ? "..." : "Invite"}
-              </button>
+            <div className="mt-2">
+              <div className="flex gap-2">
+                <input
+                  autoFocus
+                  value={inviteInput}
+                  onChange={(e) => setInviteInput?.(e.target.value)}
+                  onFocus={() => void openContacts()}
+                  onBlur={() => window.setTimeout(() => setShowContacts(false), 150)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleInviteAndRefresh();
+                    }
+                  }}
+                  placeholder="name@example.com, another@example.com"
+                  className="min-w-0 flex-1 rounded-lg bg-white/5 px-3 py-2 text-sm text-white outline-none placeholder:text-white/30"
+                />
+                <button
+                  onClick={() => void handleInviteAndRefresh()}
+                  disabled={inviting || !inviteInput.trim()}
+                  className="shrink-0 rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+                >
+                  {inviting ? "..." : "Invite"}
+                </button>
+              </div>
+              {showContacts && (loadingContacts || filteredContacts.length > 0) && (
+                // In normal flow, not absolutely positioned — this panel
+                // itself can scroll, and an absolutely-positioned overlay
+                // near the edge of a scroll container gets clipped by it
+                // invisible even when it's rendering and positioned
+                // correctly (found and fixed the same bug in the
+                // dashboard's schedule modal earlier).
+                <div className="mt-1 max-h-40 overflow-y-auto rounded-lg border border-white/10 bg-[#2b2c30]">
+                  {loadingContacts ? (
+                    <div className="px-3 py-2 text-xs text-white/40">Loading…</div>
+                  ) : (
+                    filteredContacts.map((contact) => {
+                      const added = alreadyInvitedEmails.has(contact.email.toLowerCase()) || inviteEmails.includes(contact.email.toLowerCase());
+                      return (
+                        <button
+                          key={contact.id}
+                          type="button"
+                          disabled={added}
+                          onMouseDown={() => addContactEmail(contact.email)}
+                          className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm hover:bg-white/5 disabled:opacity-50"
+                        >
+                          <span className="min-w-0 truncate">
+                            <span className="block truncate font-medium">{contact.name ?? contact.email}</span>
+                            {contact.name && <span className="block truncate text-xs text-white/45">{contact.email}</span>}
+                          </span>
+                          {added ? <Check size={14} className="shrink-0 text-accent" /> : <UserPlus size={14} className="shrink-0 text-white/40" />}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

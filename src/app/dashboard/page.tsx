@@ -61,6 +61,17 @@ export default function DashboardPage() {
   const router = useRouter();
   const [user, setUser] = useState<SessionUser | null>(null);
   const [checkingAuth, setCheckingAuth] = useState(true);
+  // Used for the "is this meeting still upcoming" check and the
+  // schedule-form's minimum date/time — Date.now() can't be called
+  // directly during render (React Compiler's purity rule flags it: the
+  // same render must produce the same output every time it's called, and
+  // a live clock read breaks that). A once-a-minute refresh is more than
+  // enough precision for either use.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   const [roomLink, setRoomLink] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -370,7 +381,7 @@ export default function DashboardPage() {
                   </div>
                   {m.endAt ? (
                     <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-muted">Ended</span>
-                  ) : m.scheduledAt && new Date(m.scheduledAt).getTime() > Date.now() ? (
+                  ) : m.scheduledAt && new Date(m.scheduledAt).getTime() > now ? (
                     <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-accent">Scheduled</span>
                   ) : (
                     <button
@@ -412,7 +423,7 @@ export default function DashboardPage() {
                   required
                   value={scheduleDateTime}
                   onChange={(e) => setScheduleDateTime(e.target.value)}
-                  min={new Date(Date.now() + 60_000).toISOString().slice(0,16)}
+                  min={new Date(now + 60_000).toISOString().slice(0,16)}
                   className="mt-2 w-full rounded-lg border border-edge bg-surface2 px-3 py-2.5 text-sm outline-none focus:border-accent"
                 />
               </label>

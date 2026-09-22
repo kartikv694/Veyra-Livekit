@@ -2,11 +2,13 @@
  *
  * Host-only. Removes another active participant from the meeting (SRS:
  * "Host can ... remove participants"). Sets their `Participant.leftAt`,
- * then notifies them directly (`meeting:removed`) and disconnects their
- * socket(s) — which fires the normal disconnect handler in socket-server/server.ts, so
- * everyone else's tile for them disappears the same way it would if they'd
- * left on their own. No separate "you were removed, tell everyone" event
- * is needed for that part.
+ * then notifies them directly (`meeting:removed`, via LiveKit's data
+ * channel — see src/lib/livekit-emitters.ts) and disconnects them from
+ * the LiveKit room server-side, so everyone else's tile for them
+ * disappears the same way it would if they'd left on their own. No
+ * separate "you were removed, tell everyone" event is needed for that
+ * part — LiveKit's own ParticipantDisconnected fires for everyone still
+ * in the room once they're gone.
  *
  * Known limitation, worth knowing rather than discovering by surprise:
  * this doesn't ban the person. Their `Participant` row already exists, so
@@ -31,7 +33,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { resolveHostAction } from "@/lib/host-action";
-import { emitToUser } from "@/lib/socket-emitters";
+import { emitToUser } from "@/lib/livekit-emitters";
 
 export const runtime = "nodejs";
 

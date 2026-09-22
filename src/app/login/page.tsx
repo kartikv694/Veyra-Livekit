@@ -32,11 +32,23 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
 
   // Pick up ?email= from a /signup redirect (already-registered email).
+  // Deliberately an effect, not a useState lazy initializer reading
+  // window directly: this page is statically prerendered, so the
+  // initializer would run with window undefined at build/server-render
+  // time and a real value on the client — a hydration mismatch.
+  // useSearchParams() avoids that but needs a Suspense boundary around
+  // an otherwise-static page for no real benefit here. Effect-after-mount
+  // is what actually keeps server and client markup identical; the
+  // "state update in an effect" the linter flags is safe in this
+  // specific case since it can only ever run once (empty deps) and
+  // can't cascade.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const prefill = params.get("email");
     if (prefill) setEmail(prefill);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

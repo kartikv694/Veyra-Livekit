@@ -40,7 +40,11 @@
  *   { "token": string }
  *
  * Responses:
- *   200  { meeting: {...}, participant: {...} }              — let straight in
+ *   200  { meeting: {...}, participant: {...}, participants: [...],
+ *          livekitToken: string | null, livekitUrl: string | null }
+ *        — let straight in. livekitToken/livekitUrl are null if LiveKit
+ *          isn't configured (env vars unset) rather than failing the
+ *          whole join — see the LiveKit section below.
  *   202  { pending: true, requestId: number }                 — waiting on host
  *   400  { error, details }  — validation failed
  *   401  { error }           — missing/invalid auth token
@@ -53,8 +57,9 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { buildRoomLink } from "@/lib/room-code";
-import { emitToUser } from "@/lib/socket-emitters";
+import { emitToUser } from "@/lib/livekit-emitters";
 import { isMeetingExpired } from "@/lib/meeting-expiry";
+import { mintLiveKitToken, getLiveKitUrl } from "@/lib/livekit";
 
 export const runtime = "nodejs";
 
@@ -198,6 +203,27 @@ export async function POST(req: NextRequest) {
     orderBy: { joinedAt: "asc" },
   });
 
+  // LiveKit token for this join — minted fresh every time (including a
+  // rejoin after a refresh), not stored. If LiveKit isn't configured yet
+  // (env vars unset — e.g. mid-migration, before the frontend has been
+  // switched over to it), this degrades to null rather than failing the
+  // whole join: the room name/media transport aren't ready for it yet,
+  // but chat, presence, and everything else this route already provides
+  // should keep working regardless.
+  let livekitToken: string | null = null;
+  let livekitUrl: string | null = null;
+  try {
+    livekitUrl = getLiveKitUrl();
+    const me = await prisma.users.findUnique({ where: { id: auth.sub }, select: { name: true } });
+    livekitToken = await mintLiveKitToken({
+      roomName: meeting.token,
+      identity: String(auth.sub),
+      name: me?.name ?? "Guest",
+    });
+  } catch (err) {
+    console.error("Failed to mint LiveKit token (LiveKit not configured yet?):", err);
+  }
+
   return NextResponse.json({
     meeting: {
       id: meeting.id,
@@ -229,5 +255,7 @@ export async function POST(req: NextRequest) {
       joinedAt: p.joinedAt,
       leftAt: p.leftAt,
     })),
+    livekitToken,
+    livekitUrl,
   });
 }

@@ -1,21 +1,39 @@
 "use client";
 
 /**
- * Real-time layer for the meeting room: connects to the Socket.IO
- * signaling server (see ../../../socket-server/server.ts) and maintains a full-mesh set of WebRTC
- * peer connections — one RTCPeerConnection per other participant currently
- * in the call, each carrying our local audio/video tracks and receiving
- * theirs.
+ * Real-time layer for the meeting room. Two genuinely different jobs
+ * depending on whether LiveKit is configured (the `establishMediaConnections`
+ * argument, effectively `!livekitActive` from the room page):
  *
- * Mesh topology (everyone connects directly to everyone) is the simplest
- * approach and is fine at small scale; it doesn't scale gracefully to large
- * meetings since each participant's upload bandwidth grows with the number
- * of others. A media server (LiveKit/Mediasoup, both already named in the
- * SRS's tech stack table as the alternative) is the standard fix if/when
- * that becomes a problem — swapping it in means replacing this hook, not
- * the room page or VideoTile, since both just consume `peers`.
+ * LiveKit configured (the normal case now): this hook's socket connection
+ * is skipped entirely — see the early return at the top of the main
+ * effect. Every real-time event it would otherwise carry (host-controls,
+ * chat, reactions, hand-raise, join-request notifications, layout
+ * settings) already has a LiveKit-primary path: REST routes push via
+ * src/lib/livekit-emitters.ts (a direct server-to-server call to LiveKit
+ * Cloud, e.g. mute/camera-off/remove/end), and client-to-client events
+ * (reactions, hand-raise, layout-settings) go through
+ * useLiveKitRoom's sendData. handleRealtimeEvent is the single dispatcher
+ * either path calls into (lock the mic button, update a peer's tile,
+ * leave the meeting, etc.) — this hook's own socket listeners exist only
+ * for the mesh-fallback deployment (below), not as a live fallback
+ * alongside LiveKit. handRaisedByUserId is tracked as its own map,
+ * independent of the peers roster below, specifically so hand-raise
+ * doesn't have a hidden dependency on the socket-only peer:joined having
+ * created a roster entry first.
  *
- * Signaling handshake, mirroring socket-server/server.ts:
+ * LiveKit NOT configured (a deployment missing LIVEKIT_* env vars): this
+ * hook falls all the way back to a full-mesh set of WebRTC peer
+ * connections — one RTCPeerConnection per other participant, each
+ * carrying local audio/video tracks and receiving theirs directly, no
+ * media server involved. Mesh topology is the simplest approach and is
+ * fine at small scale; it doesn't scale gracefully to large meetings
+ * since each participant's upload bandwidth grows with the number of
+ * others — LiveKit is the actual fix, this is what keeps a
+ * misconfigured deployment from having no media transport at all rather
+ * than a proper migration path.
+ *
+ * Mesh signaling handshake, mirroring socket-server/server.ts:
  *   1. On connect, the server tells us who's already in the room
  *      ("room:peers") — we create a PeerConnection for each and send them
  *      an offer, since we're the newcomer.
@@ -26,16 +44,19 @@
  *   4. "peer:media-state" carries live mic/camera toggles (not persisted —
  *      see socket-server/server.ts). "peer:left" tears down that peer's connection.
  *
- * Also listens for host-initiated actions pushed from REST route handlers
- * (see src/lib/socket-emitters.ts, which forwards to socket-server): "participant:force-muted" updates the
- * affected peer's `micOn` for everyone (and, if it's *you*, fires
- * `onForceMuted` so the room page can actually disable your mic track),
- * "meeting:removed" fires `onRemoved`, and "meeting:ended" fires
- * `onMeetingEnded`.
+ * There used to also be a client-side emitHostControl fallback sending
+ * host-control events directly over the socket — that existed
+ * specifically because the old REST-route mechanism (an internal HTTP
+ * call from Vercel to the Render-hosted socket server) could be
+ * unreliable when that service was cold-starting. LiveKit's sendData()
+ * doesn't share that failure mode, so the fallback's entire
+ * justification went away with it; removed rather than carried forward
+ * as unnecessary complexity.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import { getToken } from "@/lib/auth-client";
+import { RoomEvent, type Room } from "livekit-client";
+import { getToken, authHeaders } from "@/lib/auth-client";
 
 export interface RemotePeer {
   socketId: string;
@@ -138,8 +159,29 @@ export function useMeetingRoom(
   myUserId: number | null,
   callbacks: MeetingRoomCallbacks = {},
   enabled: boolean = true,
+  establishMediaConnections: boolean = true,
+  /**
+   * The connected LiveKit Room instance (from useLiveKitRoom), if any.
+   * Host-control events (mute/remove/camera-off, single or bulk, plus
+   * meeting:ended) are pushed via LiveKit's data channel — see
+   * src/lib/livekit-emitters.ts on the sending side — and dispatched
+   * through the exact same handleRealtimeEvent function the socket listeners
+   * below use, so the reaction logic (lock the mic button, update a
+   * peer's tile, etc.) is identical regardless of which transport
+   * delivered it. Chat/reactions/hand-raise/join-requests are NOT part of
+   * this yet — those still only arrive over the socket.
+   */
+  livekitRoom: Room | null = null,
 ) {
   const [peers, setPeers] = useState<Record<string, RemotePeer>>({});
+  // Decoupled from `peers` deliberately — hand-raise is the one signal
+  // that isn't natively tracked by LiveKit, but keying it off `peers`
+  // would make it silently depend on peer:joined having already created
+  // an entry there first, which is a socket-only mechanism. This map is
+  // keyed directly by userId and updated independently, so hand-raise
+  // works correctly even in a future where the socket connection itself
+  // goes away entirely.
+  const [handRaisedByUserId, setHandRaisedByUserId] = useState<Record<number, boolean>>({});
   const [connected, setConnected] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
@@ -160,16 +202,29 @@ export function useMeetingRoom(
   const pendingIceRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
   const peerUsersRef = useRef<Record<string, number>>({});
   const localStreamRef = useRef<MediaStream | null>(localStream);
+  // Read at socket-event time (the socket effect below only re-runs when
+  // roomToken/enabled change), so it needs to be a ref, same as the
+  // callbacks. Kept current in an effect rather than during render.
+  const establishMediaRef = useRef(establishMediaConnections);
   // Ref so the socket effect (which intentionally only re-runs on
   // roomToken changing) always calls the latest callbacks, not stale ones
   // captured when the socket was first created.
   const callbacksRef = useRef(callbacks);
-  callbacksRef.current = callbacks;
   // Same reasoning: myUserId is often still null on first render (auth
   // check hasn't resolved yet) by the time this effect first fires, and
   // without a ref that null would be captured forever.
   const myUserIdRef = useRef(myUserId);
-  myUserIdRef.current = myUserId;
+  // Updating a ref directly during render (as callbacksRef/myUserIdRef
+  // used to do here) is a React rules-of-hooks violation — refs are only
+  // safe to write outside of render (effects, event handlers). Merged
+  // into the same no-dependency-array effect as establishMediaRef above
+  // rather than a separate one, since all three exist for the identical
+  // reason (keep a ref current for the socket effect's closures).
+  useEffect(() => {
+    establishMediaRef.current = establishMediaConnections;
+    callbacksRef.current = callbacks;
+    myUserIdRef.current = myUserId;
+  });
 
   // Keep the ref current, and attach the local stream's tracks to any peer
   // connections that were created before the camera/mic finished loading.
@@ -202,6 +257,188 @@ export function useMeetingRoom(
     });
   }, []);
 
+  /**
+   * Single source of truth for every host-control event's reaction logic
+   * (lock the mic button, update a peer's tile, leave the meeting, etc.),
+   * regardless of which transport delivered it. The socket listeners
+   * below call this directly with each event's already-parsed payload;
+   * the LiveKit data-channel listener (further down) parses its raw
+   * `{event, payload}` JSON and calls the exact same function. Keeping
+   * this as one function rather than duplicating the logic per-transport
+   * is what guarantees the two paths can't silently drift apart.
+   */
+  const handleRealtimeEvent = useCallback((event: string, payload: unknown) => {
+    switch (event) {
+      case "participant:force-muted": {
+        const { userId: mutedUserId } = payload as { userId: number };
+        // Update that person's tile for everyone watching...
+        setPeers((prev) => {
+          const entry = Object.entries(prev).find(([, p]) => p.userId === mutedUserId);
+          if (!entry) return prev;
+          const [socketId, peer] = entry;
+          return { ...prev, [socketId]: { ...peer, micOn: false } };
+        });
+        // ...and if it was *me*, tell the room page to actually disable my track.
+        if (mutedUserId === myUserIdRef.current) {
+          callbacksRef.current.onForceMuted?.();
+        }
+        break;
+      }
+      case "participant:force-unmuted": {
+        const { userId: targetUserId } = payload as { userId: number };
+        // Deliberately does NOT set micOn: true here. Releasing the lock
+        // isn't the same as the mic actually being on — the participant
+        // still has to click their own mic button (see onForceUnmuted in
+        // the room page, which only clears the lock, not the track). If
+        // this set micOn: true optimistically, everyone else's view
+        // would show them as "on" — rendering their audio/video tile as
+        // live — while the actual track stays disabled, which is
+        // exactly what produced the black camera tile bug. The real
+        // on/off state only ever comes from their own peer:media-state
+        // broadcast (or, under LiveKit, the actual track state), once
+        // they actually toggle it themselves.
+        if (targetUserId === myUserIdRef.current) callbacksRef.current.onForceUnmuted?.();
+        break;
+      }
+      case "participant:force-camera-off": {
+        const { userId: targetUserId } = payload as { userId: number };
+        setPeers((prev) => {
+          const entry = Object.entries(prev).find(([, p]) => p.userId === targetUserId);
+          if (!entry) return prev;
+          const [socketId, peer] = entry;
+          return { ...prev, [socketId]: { ...peer, cameraOn: false } };
+        });
+        if (targetUserId === myUserIdRef.current) {
+          callbacksRef.current.onForceCameraOff?.();
+        }
+        break;
+      }
+      case "participant:force-camera-on": {
+        const { userId: targetUserId } = payload as { userId: number };
+        // Deliberately does NOT set cameraOn: true here — see the
+        // comment on participant:force-unmuted above, same reasoning
+        // exactly. This was the actual bug: setting cameraOn: true
+        // optimistically here made every viewer's tile for this person
+        // render the <video> element (cameraOn && stream both true)
+        // while their real track was still disabled — producing a black
+        // tile instead of the avatar, right after the host released a
+        // lock and before the participant had actually turned their
+        // camera back on.
+        if (targetUserId === myUserIdRef.current) callbacksRef.current.onForceCameraOn?.();
+        break;
+      }
+      case "meeting:mute-all": {
+        const { userIds } = payload as { userIds: number[] };
+        const targetSet = new Set(userIds);
+        setPeers((prev) => {
+          const next = { ...prev };
+          for (const [socketId, peer] of Object.entries(prev)) {
+            if (targetSet.has(peer.userId)) next[socketId] = { ...peer, micOn: false };
+          }
+          return next;
+        });
+        if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) {
+          callbacksRef.current.onForceMuted?.();
+        }
+        break;
+      }
+      case "meeting:unmute-all": {
+        // See the comment on participant:force-unmuted above — this is
+        // the bulk version of the exact same fix. isMuted (DB-facing
+        // display state, e.g. for the People panel) is fine to update
+        // here since that's just "did the host release the lock", not
+        // "is their mic actually on" — but cameraOn/micOn (which gate
+        // whether a tile renders live video) must not be touched until
+        // they actually toggle it themselves.
+        const { userIds } = payload as { userIds: number[] };
+        const targetSet = new Set(userIds);
+        setPeers((prev) => {
+          const next = { ...prev };
+          for (const [socketId, peer] of Object.entries(prev)) {
+            if (targetSet.has(peer.userId)) next[socketId] = { ...peer, isMuted: false };
+          }
+          return next;
+        });
+        if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) callbacksRef.current.onForceUnmuted?.();
+        break;
+      }
+      case "meeting:camera-off-all": {
+        const { userIds } = payload as { userIds: number[] };
+        const targetSet = new Set(userIds);
+        setPeers((prev) => {
+          const next = { ...prev };
+          for (const [socketId, peer] of Object.entries(prev)) {
+            if (targetSet.has(peer.userId)) next[socketId] = { ...peer, cameraOn: false };
+          }
+          return next;
+        });
+        if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) {
+          callbacksRef.current.onForceCameraOff?.();
+        }
+        break;
+      }
+      case "meeting:camera-on-all": {
+        // See the comment on participant:force-camera-on and
+        // meeting:unmute-all above — same fix, same reasoning.
+        const { userIds } = payload as { userIds: number[] };
+        const targetSet = new Set(userIds);
+        setPeers((prev) => {
+          const next = { ...prev };
+          for (const [socketId, peer] of Object.entries(prev)) {
+            if (targetSet.has(peer.userId)) next[socketId] = { ...peer, isCameraOff: false };
+          }
+          return next;
+        });
+        if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) callbacksRef.current.onForceCameraOn?.();
+        break;
+      }
+      case "meeting:removed": {
+        callbacksRef.current.onRemoved?.();
+        break;
+      }
+      case "meeting:ended": {
+        callbacksRef.current.onMeetingEnded?.();
+        break;
+      }
+      case "peer:hand-raised": {
+        // Always userId-keyed regardless of transport — see the socket
+        // listener below, which translates its raw socketId-keyed
+        // payload before calling this, so this one lookup works the
+        // same for both paths and doesn't need to know which one it was.
+        const { userId: targetUserId, raised } = payload as { userId: number; raised: boolean };
+        setHandRaisedByUserId((prev) => (prev[targetUserId] === raised ? prev : { ...prev, [targetUserId]: raised }));
+        // Also kept in sync on socketPeers, for the mesh-fallback path,
+        // which still reads handRaised from there.
+        setPeers((prev) => {
+          const entry = Object.entries(prev).find(([, p]) => p.userId === targetUserId);
+          if (!entry) return prev;
+          const [socketId, peer] = entry;
+          return { ...prev, [socketId]: { ...peer, handRaised: raised } };
+        });
+        break;
+      }
+      case "peer:reaction": {
+        const { emoji, name } = payload as { emoji: string; name: string };
+        callbacksRef.current.onReaction?.(emoji, name);
+        break;
+      }
+      case "peer:chat-message": {
+        const { text, name, userId: fromUserId, at } = payload as { text: string; name: string; userId: number; at: number };
+        callbacksRef.current.onChatMessage?.({ text, fromName: name, fromUserId, at });
+        break;
+      }
+      case "join-request:new": {
+        callbacksRef.current.onJoinRequest?.(payload as { requestId: number; userId: number; name: string });
+        break;
+      }
+      case "meeting:layout-settings": {
+        const { maxVisibleTiles } = payload as { maxVisibleTiles: number };
+        callbacksRef.current.onLayoutSettings?.(maxVisibleTiles);
+        break;
+      }
+    }
+  }, []);
+
   const flushPendingIce = useCallback(async (socketId: string, pc: RTCPeerConnection) => {
     const queued = pendingIceRef.current[socketId];
     if (!queued?.length || !pc.remoteDescription) return;
@@ -214,6 +451,22 @@ export function useMeetingRoom(
       }
     }
   }, []);
+
+  /**
+   * Adds a peer to the roster without opening a WebRTC connection — the
+   * same entry createPeerConnection registers, minus the RTCPeerConnection.
+   * Used when media is carried by LiveKit instead of the mesh.
+   */
+  const registerPeer = useCallback(
+    (socketId: string, userId: number, name: string, meta: { isHost?: boolean; isMuted?: boolean; isCameraOff?: boolean } = {}) => {
+      peerUsersRef.current[socketId] = userId;
+      setPeers((prev) => ({
+        ...prev,
+        [socketId]: prev[socketId] ?? { socketId, userId, name, stream: null, screenStream: null, cameraTrackId: null, cameraAudioTrackId: null, micOn: true, cameraOn: true, handRaised: false, isHost: Boolean(meta.isHost), isMuted: Boolean(meta.isMuted), isCameraOff: Boolean(meta.isCameraOff) },
+      }));
+    },
+    [],
+  );
 
   const createPeerConnection = useCallback(
     (socketId: string, userId: number, name: string, meta: { isHost?: boolean; isMuted?: boolean; isCameraOff?: boolean } = {}): RTCPeerConnection => {
@@ -341,6 +594,21 @@ export function useMeetingRoom(
   useEffect(() => {
     const token = getToken();
     if (!enabled || !token || !roomToken) return;
+    if (!establishMediaConnections) {
+      // LiveKit is active — every real-time event this socket would
+      // carry (host-controls, chat, reactions, hand-raise, join-request
+      // notifications, layout-settings) already has a LiveKit-primary
+      // path (see handleRealtimeEvent and the DataReceived listener
+      // below), and the mesh itself is what establishMediaConnections
+      // already gates off. The only things this socket would otherwise
+      // still be doing are the roster's peer:joined/peer:left "instant"
+      // notification (refreshRoster's own 5s poll already covers the
+      // same ground, just slightly slower) and acting as a fallback
+      // transport for everything above. Skipping the connection
+      // entirely — not just leaving it idle — is what actually removes
+      // the dependency on that separate service being up at all.
+      return;
+    }
 
     // Set true the moment cleanup starts (see the return below) — guards
     // the handlers below from logging a connection failure that was
@@ -415,7 +683,12 @@ export function useMeetingRoom(
         // here too would race with that and send a duplicate/conflicting
         // offer (glare) on the very first connection attempt.
         for (const peer of existingPeers) {
-          createPeerConnection(peer.socketId, peer.userId, peer.name, peer);
+          if (establishMediaRef.current) {
+            createPeerConnection(peer.socketId, peer.userId, peer.name, peer);
+          } else {
+            // Media goes over LiveKit — just put them on the roster.
+            registerPeer(peer.socketId, peer.userId, peer.name, peer);
+          }
         }
       },
     );
@@ -446,6 +719,10 @@ export function useMeetingRoom(
         name: string;
         sdp: RTCSessionDescriptionInit;
       }) => {
+        // With LiveKit carrying media there is no mesh to answer into. A
+        // stray offer (e.g. from a tab still running an older build) is
+        // ignored rather than half-building a connection nobody uses.
+        if (!establishMediaRef.current) return;
         const pc = createPeerConnection(from, fromUserId, name);
         // Set synchronously, before any await below — see the ref's own
         // comment for why the timing here matters.
@@ -519,7 +796,9 @@ export function useMeetingRoom(
     socket.on(
       "peer:hand-raised",
       ({ socketId, raised }: { socketId: string; raised: boolean }) => {
-        setPeers((prev) => (prev[socketId] ? { ...prev, [socketId]: { ...prev[socketId], handRaised: raised } } : prev));
+        const raisedUserId = peerUsersRef.current[socketId];
+        if (raisedUserId === undefined) return;
+        handleRealtimeEvent("peer:hand-raised", { userId: raisedUserId, raised });
       },
     );
 
@@ -540,19 +819,13 @@ export function useMeetingRoom(
       },
     );
 
-    socket.on("peer:reaction", ({ emoji, name }: { emoji: string; name: string }) => {
-      callbacksRef.current.onReaction?.(emoji, name);
-    });
+    socket.on("peer:reaction", (payload: { emoji: string; name: string }) => handleRealtimeEvent("peer:reaction", payload));
 
-    socket.on("meeting:layout-settings", ({ maxVisibleTiles }: { maxVisibleTiles: number }) => {
-      callbacksRef.current.onLayoutSettings?.(maxVisibleTiles);
-    });
+    socket.on("meeting:layout-settings", (payload: { maxVisibleTiles: number }) => handleRealtimeEvent("meeting:layout-settings", payload));
 
     socket.on(
       "peer:chat-message",
-      ({ text, name, userId, at }: { text: string; name: string; userId: number; at: number }) => {
-        callbacksRef.current.onChatMessage?.({ text, fromName: name, fromUserId: userId, at });
-      },
+      (payload: { text: string; name: string; userId: number; at: number }) => handleRealtimeEvent("peer:chat-message", payload),
     );
 
     socket.on("peer:left", ({ socketId, userId: leftUserId }: { socketId: string; userId: number }) => {
@@ -563,133 +836,22 @@ export function useMeetingRoom(
       if (!anotherSocket) callbacksRef.current.onPeerLeft?.({ socketId, userId: leftUserId });
     });
 
-    socket.on("participant:force-muted", ({ userId: mutedUserId }: { userId: number }) => {
-      // Update that person's tile for everyone watching...
-      setPeers((prev) => {
-        const entry = Object.entries(prev).find(([, p]) => p.userId === mutedUserId);
-        if (!entry) return prev;
-        const [socketId, peer] = entry;
-        return { ...prev, [socketId]: { ...peer, micOn: false } };
-      });
-      // ...and if it was *me*, tell the room page to actually disable my track.
-      if (mutedUserId === myUserIdRef.current) {
-        callbacksRef.current.onForceMuted?.();
-      }
-    });
+    // Thin delegations to handleRealtimeEvent (defined above) — the actual
+    // reaction logic lives there once, shared with the LiveKit
+    // data-channel listener further down.
+    socket.on("participant:force-muted", (payload: { userId: number }) => handleRealtimeEvent("participant:force-muted", payload));
+    socket.on("participant:force-unmuted", (payload: { userId: number }) => handleRealtimeEvent("participant:force-unmuted", payload));
+    socket.on("participant:force-camera-off", (payload: { userId: number }) => handleRealtimeEvent("participant:force-camera-off", payload));
+    socket.on("participant:force-camera-on", (payload: { userId: number }) => handleRealtimeEvent("participant:force-camera-on", payload));
+    socket.on("meeting:mute-all", (payload: { userIds: number[] }) => handleRealtimeEvent("meeting:mute-all", payload));
+    socket.on("meeting:unmute-all", (payload: { userIds: number[] }) => handleRealtimeEvent("meeting:unmute-all", payload));
+    socket.on("meeting:camera-off-all", (payload: { userIds: number[] }) => handleRealtimeEvent("meeting:camera-off-all", payload));
+    socket.on("meeting:camera-on-all", (payload: { userIds: number[] }) => handleRealtimeEvent("meeting:camera-on-all", payload));
 
-    socket.on("participant:force-unmuted", ({ userId: targetUserId }: { userId: number }) => {
-      // Deliberately does NOT set micOn: true here. Releasing the lock
-      // isn't the same as the mic actually being on — the participant
-      // still has to click their own mic button (see onForceUnmuted in
-      // the room page, which only clears the lock, not the track). If
-      // this set micOn: true optimistically, everyone else's view would
-      // show them as "on" — rendering their audio/video tile as live —
-      // while the actual track stays disabled, which is exactly what
-      // produced the black camera tile bug. The real on/off state only
-      // ever comes from their own peer:media-state broadcast, once they
-      // actually toggle it themselves.
-      if (targetUserId === myUserIdRef.current) callbacksRef.current.onForceUnmuted?.();
-    });
+    socket.on("join-request:new", (payload: { requestId: number; userId: number; name: string }) => handleRealtimeEvent("join-request:new", payload));
 
-    socket.on("participant:force-camera-off", ({ userId: targetUserId }: { userId: number }) => {
-      setPeers((prev) => {
-        const entry = Object.entries(prev).find(([, p]) => p.userId === targetUserId);
-        if (!entry) return prev;
-        const [socketId, peer] = entry;
-        return { ...prev, [socketId]: { ...peer, cameraOn: false } };
-      });
-      if (targetUserId === myUserIdRef.current) {
-        callbacksRef.current.onForceCameraOff?.();
-      }
-    });
-
-    socket.on("participant:force-camera-on", ({ userId: targetUserId }: { userId: number }) => {
-      // Deliberately does NOT set cameraOn: true here — see the comment
-      // on participant:force-unmuted above, same reasoning exactly. This
-      // was the actual bug: setting cameraOn: true optimistically here
-      // made every viewer's tile for this person render the <video>
-      // element (cameraOn && stream both true) while their real track
-      // was still disabled — producing a black tile instead of the
-      // avatar, right after the host released a lock and before the
-      // participant had actually turned their camera back on.
-      if (targetUserId === myUserIdRef.current) callbacksRef.current.onForceCameraOn?.();
-    });
-
-    socket.on("meeting:mute-all", ({ userIds }: { userIds: number[] }) => {
-      const targetSet = new Set(userIds);
-      setPeers((prev) => {
-        const next = { ...prev };
-        for (const [socketId, peer] of Object.entries(prev)) {
-          if (targetSet.has(peer.userId)) next[socketId] = { ...peer, micOn: false };
-        }
-        return next;
-      });
-      if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) {
-        callbacksRef.current.onForceMuted?.();
-      }
-    });
-
-    socket.on("meeting:unmute-all", ({ userIds }: { userIds: number[] }) => {
-      // See the comment on participant:force-unmuted above — this is the
-      // bulk version of the exact same fix. isMuted (DB-facing display
-      // state, e.g. for the People panel) is fine to update here since
-      // that's just "did the host release the lock", not "is their mic
-      // actually on" — but cameraOn/micOn (which gate whether a tile
-      // renders live video) must not be touched until they actually
-      // toggle it themselves.
-      const targetSet = new Set(userIds);
-      setPeers((prev) => {
-        const next = { ...prev };
-        for (const [socketId, peer] of Object.entries(prev)) {
-          if (targetSet.has(peer.userId)) next[socketId] = { ...peer, isMuted: false };
-        }
-        return next;
-      });
-      if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) callbacksRef.current.onForceUnmuted?.();
-    });
-
-    socket.on("meeting:camera-off-all", ({ userIds }: { userIds: number[] }) => {
-      const targetSet = new Set(userIds);
-      setPeers((prev) => {
-        const next = { ...prev };
-        for (const [socketId, peer] of Object.entries(prev)) {
-          if (targetSet.has(peer.userId)) next[socketId] = { ...peer, cameraOn: false };
-        }
-        return next;
-      });
-      if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) {
-        callbacksRef.current.onForceCameraOff?.();
-      }
-    });
-
-    socket.on("meeting:camera-on-all", ({ userIds }: { userIds: number[] }) => {
-      // See the comment on participant:force-camera-on and
-      // meeting:unmute-all above — same fix, same reasoning.
-      const targetSet = new Set(userIds);
-      setPeers((prev) => {
-        const next = { ...prev };
-        for (const [socketId, peer] of Object.entries(prev)) {
-          if (targetSet.has(peer.userId)) next[socketId] = { ...peer, isCameraOff: false };
-        }
-        return next;
-      });
-      if (myUserIdRef.current !== null && targetSet.has(myUserIdRef.current)) callbacksRef.current.onForceCameraOn?.();
-    });
-
-    socket.on(
-      "join-request:new",
-      (request: { requestId: number; userId: number; name: string }) => {
-        callbacksRef.current.onJoinRequest?.(request);
-      },
-    );
-
-    socket.on("meeting:removed", () => {
-      callbacksRef.current.onRemoved?.();
-    });
-
-    socket.on("meeting:ended", () => {
-      callbacksRef.current.onMeetingEnded?.();
-    });
+    socket.on("meeting:removed", () => handleRealtimeEvent("meeting:removed", undefined));
+    socket.on("meeting:ended", () => handleRealtimeEvent("meeting:ended", undefined));
 
     return () => {
       cancelled = true;
@@ -698,18 +860,43 @@ export function useMeetingRoom(
       socketRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomToken, enabled]);
+  }, [roomToken, enabled, establishMediaConnections]);
 
-  /** Send a host control over the already-authenticated Socket.IO connection. */
-  const emitHostControl = useCallback((
-    event: "host:mute-participant" | "host:camera-participant" | "host:mute-all" | "host:camera-all",
-    payload: unknown,
-  ): boolean => {
-    const socket = socketRef.current;
-    if (!socket || !socket.connected) return false;
-    socket.emit(event, payload);
-    return true;
-  }, []);
+  // Host-control events also arrive via LiveKit's data channel (see
+  // src/lib/livekit-emitters.ts on the sending side) once a LiveKit room
+  // is connected, dispatched through the exact same handleRealtimeEvent
+  // function the socket listeners above use. A separate effect from the
+  // socket connection above — this room's lifecycle is entirely owned by
+  // useLiveKitRoom and can become available (or go away, on disconnect)
+  // at a different time than the socket connects.
+  useEffect(() => {
+    if (!livekitRoom) return;
+    const handleDataReceived = (payload: Uint8Array, participant?: { identity: string }) => {
+      // Server-sent messages (host-control events, chat) have no
+      // participant — always processed. Client-to-client messages
+      // (reactions, hand-raise) do have one; if it's ourselves, skip —
+      // the sender already updated its own UI directly when it sent
+      // (see the room page), specifically so this never depends on
+      // whether LiveKit's publishData happens to loop a message back to
+      // its own sender or not. Either behavior is handled correctly:
+      // if it does loop back, this skip avoids a double update; if it
+      // doesn't, there was nothing to skip anyway.
+      if (participant && participant.identity === livekitRoom.localParticipant.identity) {
+        return;
+      }
+      try {
+        const decoded = new TextDecoder().decode(payload);
+        const parsed = JSON.parse(decoded) as { event: string; payload?: unknown };
+        handleRealtimeEvent(parsed.event, parsed.payload);
+      } catch (err) {
+        console.error("[Veyra] Failed to parse LiveKit data message", err);
+      }
+    };
+    livekitRoom.on(RoomEvent.DataReceived, handleDataReceived);
+    return () => {
+      livekitRoom.off(RoomEvent.DataReceived, handleDataReceived);
+    };
+  }, [livekitRoom, handleRealtimeEvent]);
 
   const broadcastMediaState = useCallback((micOn: boolean, cameraOn: boolean) => {
     socketRef.current?.emit("peer:media-state", { micOn, cameraOn });
@@ -740,9 +927,29 @@ export function useMeetingRoom(
    * attached) — otherwise replaceTrack on a connection with no video
    * sender at all would silently do nothing.
    */
-  const sendChatMessage = useCallback((text: string) => {
-    socketRef.current?.emit("peer:chat-message", { text });
-  }, []);
+  /**
+   * Persists and broadcasts a chat message via
+   * POST /api/rooms/[token]/chat (see that route — it does both halves:
+   * the DB write, and the real-time push via LiveKit's data channel).
+   * Fire-and-forget from the caller's perspective, matching this hook's
+   * other send functions — a failure is logged here rather than
+   * surfaced as a UI error, consistent with how those already behave.
+   */
+  const sendChatMessage = useCallback(async (text: string) => {
+    try {
+      const res = await fetch(`/api/rooms/${roomToken}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error("Failed to send chat message:", data.error ?? res.status);
+      }
+    } catch (err) {
+      console.error("Failed to send chat message:", err);
+    }
+  }, [roomToken]);
 
   /**
    * Adds the screen-share track as a NEW, separate sender on every peer
@@ -806,9 +1013,9 @@ export function useMeetingRoom(
 
   return {
     peers: Object.values(peers),
+    handRaisedByUserId,
     connected,
     broadcastMediaState,
-    emitHostControl,
     addScreenShareTrack,
     removeScreenShareTrack,
     broadcastScreenShareState,

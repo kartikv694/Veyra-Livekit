@@ -31,12 +31,17 @@ export default function SignupPage() {
   const [loading, setLoading] = useState(false);
 
   // Pick up ?email= from a /login redirect, without needing a Suspense
-  // boundary for useSearchParams — this is a one-off read on mount.
+  // boundary for useSearchParams — this is a one-off read on mount. Safe
+  // to suppress the state-in-effect warning here specifically: empty
+  // deps means it can only ever run once, so there's no cascade risk —
+  // see login/page.tsx's matching comment for the fuller reasoning.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const prefill = params.get("email");
     if (prefill) setEmail(prefill);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
