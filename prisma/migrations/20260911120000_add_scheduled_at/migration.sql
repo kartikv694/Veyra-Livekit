@@ -1,1 +1,0 @@
-ALTER TABLE "Meeting" ADD COLUMN IF NOT EXISTS "scheduledAt" TIMESTAMP(3);
