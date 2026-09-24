@@ -116,6 +116,13 @@ model Meeting {
   /// into a permanent record once it's over.
   chatMessages ChatMessage[]
 
+  /// AI meeting-analysis scores, one row per participant who was analyzed
+  /// — see `ParticipantAnalysis`. Populated by the LiveKit agent worker
+  /// once the meeting ends, not in real time; empty until then (and
+  /// permanently empty for meetings that ended before this feature
+  /// existed, or if the agent worker wasn't running/configured).
+  participantAnalyses ParticipantAnalysis[]
+
   /// Optional display name for the meeting, set at scheduling time (e.g.
   /// "Weekly design sync"). Shown in the confirmation email, the
   /// dashboard's meeting list, and the room header in place of the raw
@@ -344,4 +351,56 @@ model ChatMessage {
   createdAt DateTime @default(now())
 
   @@index([meetingId, createdAt])
+}
+
+/// AI-generated per-participant meeting analysis, one row per (meeting,
+/// participant) pair — written once, by the LiveKit agent worker (a
+/// separate service, not this Next.js app), after the meeting ends and
+/// it has finished analyzing that participant's accumulated transcript.
+/// Not real-time and not guaranteed to exist for every meeting: absent
+/// entirely if the agent worker wasn't running/configured, or if that
+/// participant never actually spoke (nothing to analyze).
+///
+/// Unlike ChatMessage, these rows are NOT deleted when the meeting ends
+/// — they're the point of the feature, meant to be read afterward on the
+/// host's meeting-ended screen, not a live-only artifact.
+model ParticipantAnalysis {
+  /// Surrogate primary key.
+  id Int @id @default(autoincrement())
+
+  /// The meeting this analysis belongs to.
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  /// Foreign key for `meeting`.
+  meetingId Int
+
+  /// Who this analysis is about.
+  userId Int
+
+  /// Their display name at analysis time — a snapshot, same reasoning as
+  /// ChatMessage.fromName: a later name change shouldn't rewrite history.
+  name String
+
+  /// Each scored 0-5 by the agent's LLM analysis of that participant's
+  /// transcript, per the six parameters the host asked for.
+  communication Int
+  fluency Int
+  topicKnowledge Int
+  teamworkListening Int
+  leadershipInitiative Int
+  confidenceProfessionalism Int
+
+  /// Optional short free-text note from the LLM analysis — a sentence or
+  /// two of qualitative context alongside the numeric scores. Null if the
+  /// analysis didn't produce one (or failed to parse one out).
+  summary String?
+
+  /// When this analysis was written.
+  createdAt DateTime @default(now())
+
+  /// One analysis per participant per meeting — the agent worker upserts
+  /// on this, not inserts, so a retry after a partial failure doesn't
+  /// duplicate rows.
+  @@unique([meetingId, userId])
+  @@index([meetingId])
 }

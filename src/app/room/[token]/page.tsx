@@ -885,6 +885,30 @@ export default function RoomPage() {
     const participantsByUserId = new Map(participants.map((p) => [p.userId, p]));
     return livekitPeers.map((media) => {
       const dbInfo = participantsByUserId.get(media.userId);
+      // media.userId resolves to 0 (see useLiveKitRoom's getOrCreateEntry,
+      // Number(identity) || 0) specifically when the LiveKit identity
+      // isn't a real userId at all — which is exactly what the analysis
+      // agent's own, framework-assigned identity looks like, since it was
+      // never minted through this app's own token flow. No real Veyra
+      // user ever has userId 0 (Prisma's autoincrement starts at 1), so
+      // this is an unambiguous, reliable way to detect it here — without
+      // needing the agent to coordinate on a specific identity string.
+      const isAgent = media.userId === 0;
+      if (isAgent) {
+        return {
+          socketId: `lk-agent-${media.name || "veyra-ai"}`,
+          userId: 0,
+          name: "Veyra AI",
+          stream: null,
+          screenStream: null,
+          cameraTrackId: null,
+          cameraAudioTrackId: null,
+          micOn: false,
+          cameraOn: false,
+          handRaised: false,
+          isAgent: true,
+        };
+      }
       return {
         socketId: `lk-${media.userId}`,
         userId: media.userId,
@@ -956,6 +980,17 @@ export default function RoomPage() {
         return;
       }
       if (!joinRes.ok) {
+        if (joinRes.status === 410) {
+          // Expired or already ended — the backend has already closed it
+          // out (see /api/rooms/join's own comment). A toast here would
+          // leave the person stuck looking at what's visually the full
+          // meeting room UI (camera preview, controls) despite never
+          // having actually joined anything — confusing, since nothing
+          // in it would actually work. Send them to the same screen
+          // anyone leaving a real, live-ended meeting sees instead.
+          exitMeeting("ended");
+          return;
+        }
         toast.error(data.error ?? "Couldn't join this meeting.");
         return;
       }
@@ -1884,6 +1919,17 @@ export default function RoomPage() {
   }, [autoEndAt, joined, durationWarningShown, myRow?.isHost]);
 
   const others = participants.filter((participant) => participant.userId !== me?.id && !participant.leftAt);
+  // A separate list from `others` on purpose — this feeds ONLY the tile-
+  // rendering loops below, not totalTiles/activeParticipantCount (both
+  // still plain `others.length + 1`), which stay human-only: the visible
+  // "N participants" badge and the solo-view/layout-mode decision should
+  // both reflect real attendees, not the AI monitor. The agent still gets
+  // its own rendered tile via this list — it's additive to the layout,
+  // never a factor in choosing which layout to show.
+  const agentPeer = peers.find((p) => p.isAgent);
+  const othersForTiles: ParticipantRow[] = agentPeer
+    ? [...others, { userId: agentPeer.userId, name: agentPeer.name, isHost: false, isMuted: false, isCameraOff: false, leftAt: null }]
+    : others;
   const liveByUserId = useMemo(() => new Map(peers.map((peer) => [peer.userId, peer])), [peers]);
   const totalTiles = others.length + 1;
   const spotlightFeatured = others.find((p) => p.isHost) ?? others[0] ?? null;
@@ -2032,7 +2078,7 @@ export default function RoomPage() {
                   handRaised={handRaised}
                 />
               </div>
-              {others.map((participant) => {
+              {othersForTiles.map((participant) => {
                 const live = liveByUserId.get(participant.userId);
                 return (
                   <div key={participant.userId} className="aspect-video h-full shrink-0 sm:aspect-auto sm:w-full sm:min-h-[110px] sm:flex-1">
@@ -2043,6 +2089,7 @@ export default function RoomPage() {
                       cameraOn={live ? live.cameraOn : false}
                       stream={live?.stream ?? null}
                       handRaised={live?.handRaised ?? false}
+                      isAgent={live?.isAgent ?? false}
                     />
                   </div>
                 );
@@ -2117,7 +2164,7 @@ export default function RoomPage() {
                   />
                 </div>
               )}
-              {others
+              {othersForTiles
                 .filter((participant) => participant.userId !== spotlightFeatured?.userId)
                 .map((participant) => {
                   const live = liveByUserId.get(participant.userId);
@@ -2130,6 +2177,7 @@ export default function RoomPage() {
                         cameraOn={live ? live.cameraOn : false}
                         stream={live?.stream ?? null}
                         handRaised={live?.handRaised ?? false}
+                        isAgent={live?.isAgent ?? false}
                       />
                     </div>
                   );
@@ -2154,7 +2202,7 @@ export default function RoomPage() {
                 />
               ),
             };
-            const otherTiles = others.map((participant) => {
+            const otherTiles = othersForTiles.map((participant) => {
               const live = liveByUserId.get(participant.userId);
               return {
                 key: String(participant.userId),
@@ -2166,6 +2214,7 @@ export default function RoomPage() {
                     cameraOn={live ? live.cameraOn : false}
                     stream={live?.stream ?? null}
                     handRaised={live?.handRaised ?? false}
+                    isAgent={live?.isAgent ?? false}
                     rounded={false}
                   />
                 ),

@@ -94,6 +94,12 @@ export interface RemotePeer {
   isHost?: boolean;
   isMuted?: boolean;
   isCameraOff?: boolean;
+  /** True for Veyra's own meeting-analysis agent — a LiveKit participant
+   *  like any other from the transport's perspective, but not a real
+   *  meeting attendee. Lets the UI render it distinctly (see VideoTile)
+   *  and exclude it from human-only surfaces (the People panel roster,
+   *  participant counts, host-control targeting). */
+  isAgent?: boolean;
 }
 
 export interface MeetingRoomCallbacks {

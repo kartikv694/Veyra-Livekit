@@ -1,4 +1,10 @@
 {
   "buildCommand": "npm run build",
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/cron/expire-meetings",
+      "schedule": "0 3 * * *"
+    }
+  ]
 }

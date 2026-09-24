@@ -24,6 +24,29 @@ import { authHeaders } from "@/lib/auth-client";
 
 type Reason = "left" | "removed" | "ended";
 
+interface ParticipantAnalysisRow {
+  userId: number;
+  name: string;
+  communication: number;
+  fluency: number;
+  topicKnowledge: number;
+  teamworkListening: number;
+  leadershipInitiative: number;
+  confidenceProfessionalism: number;
+  summary: string | null;
+}
+
+const MAX_SCORE = 5;
+
+const SCORE_LABELS: { key: keyof Omit<ParticipantAnalysisRow, "userId" | "name" | "summary">; label: string }[] = [
+  { key: "communication", label: "Communication" },
+  { key: "fluency", label: "Fluency" },
+  { key: "topicKnowledge", label: "Topic knowledge" },
+  { key: "teamworkListening", label: "Teamwork & listening" },
+  { key: "leadershipInitiative", label: "Leadership & initiative" },
+  { key: "confidenceProfessionalism", label: "Confidence & professionalism" },
+];
+
 const HEADLINES: Record<Reason, string> = {
   left: "You've left the meeting",
   removed: "You were removed from the meeting",
@@ -33,6 +56,13 @@ const HEADLINES: Record<Reason, string> = {
 const AUTO_RETURN_SECONDS = 60;
 const RING_RADIUS = 18;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
+const ANALYSIS_POLL_MS = 5000;
+// How long to keep polling before giving up — covers the agent's own
+// ~15s empty-room grace period plus real processing/LLM time, with
+// margin. Past this, either nobody said anything analyzable, the agent
+// worker isn't configured/running, or something failed — any of which
+// means waiting longer won't help.
+const ANALYSIS_MAX_WAIT_MS = 90_000;
 
 export default function MeetingEndedPage() {
   const router = useRouter();
@@ -41,6 +71,11 @@ export default function MeetingEndedPage() {
   const [rejoining, setRejoining] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(AUTO_RETURN_SECONDS);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // "idle" for anyone but a host who just ended the meeting (the only
+  // case where there's anything to wait for or show) — see the
+  // analysis-fetch effect below for the rest of the state machine.
+  const [analysisState, setAnalysisState] = useState<"idle" | "waiting" | "ready" | "unavailable">("idle");
+  const [analysis, setAnalysis] = useState<ParticipantAnalysisRow[]>([]);
 
   // Pick up ?reason= from the redirect that sent someone here — same
   // "one-off mount read, no Suspense boundary needed, no cascade risk"
@@ -52,10 +87,73 @@ export default function MeetingEndedPage() {
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect */
 
+  // Fetches (and, if not ready yet, polls for) the AI meeting analysis —
+  // only meaningful when the meeting was actually ended for everyone
+  // (not just "you left" or "you were removed", where the meeting could
+  // still be ongoing for others and the agent wouldn't have finished
+  // analyzing anything yet). A 403 here just means this viewer isn't the
+  // host — not an error worth surfacing, since analysis is host-only by
+  // design; it simply resolves to "unavailable" (nothing shown) the same
+  // as a genuine timeout would.
+  useEffect(() => {
+    if (reason !== "ended") return;
+    let cancelled = false;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    const startedAt = Date.now();
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`/api/rooms/${params.token}/analysis`, { headers: authHeaders() });
+        if (cancelled) return;
+        if (res.status === 403) {
+          setAnalysisState("unavailable");
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        const rows: ParticipantAnalysisRow[] = Array.isArray(data.analysis) ? data.analysis : [];
+        if (rows.length > 0) {
+          setAnalysis(rows);
+          setAnalysisState("ready");
+          return;
+        }
+        if (Date.now() - startedAt >= ANALYSIS_MAX_WAIT_MS) {
+          setAnalysisState("unavailable");
+          return;
+        }
+        setAnalysisState("waiting");
+        pollTimer = setTimeout(poll, ANALYSIS_POLL_MS);
+      } catch {
+        // A network hiccup mid-poll isn't fatal — just try again on the
+        // next tick rather than giving up on the first failure.
+        if (!cancelled) pollTimer = setTimeout(poll, ANALYSIS_POLL_MS);
+      }
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (pollTimer) clearTimeout(pollTimer);
+    };
+  }, [reason, params.token]);
+
+  // Derived, not separate state updated via effect — true immediately
+  // whenever there's nothing to wait for (not "ended", or analysis has
+  // resolved one way or the other), false only while a confirmed host
+  // is actively waiting on their meeting analysis. Gates the auto-return
+  // countdown effect below, so it can't redirect that host away before
+  // they get to see it.
+  const countdownReady = reason !== "ended" || analysisState === "ready" || analysisState === "unavailable";
+
   // Auto-return countdown — cancelled by cancelAutoReturn() below the
   // instant the person clicks either button, so it never fires after
-  // they've already chosen where to go.
+  // they've already chosen where to go. Gated behind countdownReady —
+  // stays paused (not even started) while a confirmed host is actively
+  // waiting on their meeting analysis, so it can't redirect them away
+  // before they get to see it. Ready immediately for every other case.
   useEffect(() => {
+    if (!countdownReady) return;
     intervalRef.current = setInterval(() => {
       // Keep this updater pure — no side effects (router.push, etc.)
       // inside it. React doesn't allow triggering another component's
@@ -70,7 +168,7 @@ export default function MeetingEndedPage() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, []);
+  }, [countdownReady]);
 
   useEffect(() => {
     if (secondsLeft === 0) {
@@ -134,7 +232,9 @@ export default function MeetingEndedPage() {
             </svg>
             <span className="text-[11px] font-semibold text-muted">{secondsLeft}</span>
           </div>
-          <span className="text-sm text-muted">Returning to your dashboard...</span>
+          <span className="text-sm text-muted">
+            {analysisState === "waiting" ? "Preparing your meeting summary…" : "Returning to your dashboard..."}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <BrandLink size={22} />
@@ -161,6 +261,65 @@ export default function MeetingEndedPage() {
             Return to home screen
           </button>
         </div>
+
+        {analysisState === "waiting" && (
+          <div className="mt-10 flex max-w-md items-center gap-3 rounded-xl border border-edge bg-surface p-4 text-left">
+            <div className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+            <div>
+              <p className="text-sm font-medium">Preparing your meeting summary</p>
+              <p className="mt-0.5 text-sm text-muted">
+                Your AI meeting analysis will appear here shortly.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {analysisState === "ready" && (
+          <div className="mt-10 w-full max-w-5xl text-left">
+            <h2 className="text-center font-display text-xl font-semibold sm:text-2xl">Meeting analysis</h2>
+            <p className="mt-1 text-center text-sm text-muted">
+              AI-generated, based on what each participant said during the meeting. Each parameter scored out of {MAX_SCORE}.
+            </p>
+            <div className="mt-6 overflow-x-auto rounded-xl border border-edge">
+              <table className="w-full min-w-[720px] border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-edge bg-surface">
+                    <th className="sticky left-0 bg-surface px-4 py-3 text-left font-medium">Participant</th>
+                    {SCORE_LABELS.map(({ key, label }) => (
+                      <th key={key} className="px-3 py-3 text-center font-medium text-muted">
+                        {label}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {analysis.map((row, i) => (
+                    <tr key={row.userId} className={i % 2 === 1 ? "bg-white/[0.02]" : undefined}>
+                      <td className="sticky left-0 whitespace-nowrap bg-inherit px-4 py-3 font-medium">{row.name}</td>
+                      {SCORE_LABELS.map(({ key }) => (
+                        <td key={key} className="px-3 py-3 text-center">
+                          <span className="font-semibold">{row[key]}</span>
+                          <span className="text-muted">/{MAX_SCORE}</span>
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {analysis.some((row) => row.summary) && (
+              <div className="mt-4 space-y-2">
+                {analysis
+                  .filter((row) => row.summary)
+                  .map((row) => (
+                    <p key={row.userId} className="text-sm text-muted">
+                      <span className="font-medium text-fg">{row.name}:</span> {row.summary}
+                    </p>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="mt-10 flex max-w-md items-start gap-3 rounded-xl border border-edge bg-surface p-4 text-left">
           <ShieldCheck size={20} className="mt-0.5 shrink-0 text-accent" />

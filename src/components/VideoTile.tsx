@@ -8,7 +8,7 @@
  * levels through Socket.IO.
  */
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { AudioWaveform, Hand, MicOff } from "lucide-react";
+import { AudioWaveform, Bot, Hand, MicOff } from "lucide-react";
 
 interface VideoTileProps {
   name: string;
@@ -21,6 +21,10 @@ interface VideoTileProps {
   isLocal?: boolean;
   /** Shows a raised-hand badge in the corner. */
   handRaised?: boolean;
+  /** True for Veyra's own meeting-analysis agent, not a human participant
+   *  — shows a bot icon and an "AI" label instead of initials, and never
+   *  has a camera/mic to render regardless of cameraOn/stream. */
+  isAgent?: boolean;
   /** Set false for full-bleed views (solo camera, presenting) to match
    *  Meet's edge-to-edge look. Defaults true for grid/thumbnail tiles. */
   rounded?: boolean;
@@ -74,6 +78,7 @@ function VideoTile({
   stream = null,
   isLocal = false,
   handRaised = false,
+  isAgent = false,
   rounded = true,
   mirrored = false,
   fit = "cover",
@@ -193,11 +198,11 @@ function VideoTile({
     <div
       className={`relative flex h-full min-h-0 items-center justify-center overflow-hidden ring-2 transition-all duration-200 ${
         rounded ? "rounded-xl" : "rounded-none"
-      } ${cameraOn && stream ? "bg-[#171A21]" : "bg-[#2A2350]"} ${
+      } ${cameraOn && stream && !isAgent ? "bg-[#171A21]" : isAgent ? "bg-[#1E2A3A]" : "bg-[#2A2350]"} ${
         speaking ? "ring-accent shadow-[0_0_24px_rgba(255,255,255,0.08)]" : "ring-transparent"
       }`}
     >
-      {cameraOn && stream ? (
+      {cameraOn && stream && !isAgent ? (
         <video
           autoPlay
           muted={isLocal}
@@ -205,6 +210,10 @@ function VideoTile({
           ref={setVideoRef}
           className={`h-full w-full ${fit === "contain" ? "object-contain" : "object-cover"} ${mirrored ? "-scale-x-100" : ""}`}
         />
+      ) : isAgent ? (
+        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-accent/15 text-accent">
+          <Bot size={28} />
+        </div>
       ) : (
         <div
           className={`flex h-16 w-16 items-center justify-center rounded-full bg-white/10 text-lg font-semibold text-white transition-transform duration-200 ${
@@ -228,10 +237,11 @@ function VideoTile({
         <span className="min-w-0 truncate text-sm font-medium text-white">
           {name}
           {isHost && <span className="ml-1.5 text-xs font-normal text-white/60">Host</span>}
+          {isAgent && <span className="ml-1.5 text-xs font-normal text-accent">AI</span>}
         </span>
         <div className="flex shrink-0 items-center gap-2">
-          <SpeakingIndicator speaking={speaking} />
-          {isMuted && <MicOff size={14} className="shrink-0 text-white/80" />}
+          {!isAgent && <SpeakingIndicator speaking={speaking} />}
+          {!isAgent && isMuted && <MicOff size={14} className="shrink-0 text-white/80" />}
         </div>
       </div>
     </div>

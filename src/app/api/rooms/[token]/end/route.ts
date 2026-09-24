@@ -15,6 +15,7 @@
 import { requireAuth, unauthorized } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { emitToMeeting } from "@/lib/livekit-emitters";
+import { endMeetingInDb } from "@/lib/end-meeting";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
@@ -41,28 +42,7 @@ export async function POST(
         return NextResponse.json({error: "This meeting has Already ended"}, {status: 409});
     }
 
-    const ended = await prisma.$transaction(async (tx) => {
-        const endAt = new Date();
-
-        const updatedMeeting = await tx.meeting.update({
-            where: { id: meeting.id },
-            data: { endAt },
-        });
-
-        // Explicitly ending for everyone also closes every currently-active
-        // participant session. A normal Leave action does NOT end the room.
-        await tx.participants.updateMany({
-            where: { meetingId: meeting.id, leftAt: null },
-            data: { leftAt: endAt },
-        });
-
-        // Chat is "live only, not saved anywhere" by design — recoverable
-        // on a refresh during the meeting (see GET .../chat), but not a
-        // permanent record once the meeting itself is over.
-        await tx.chatMessage.deleteMany({ where: { meetingId: meeting.id } });
-
-        return updatedMeeting;
-    });
+    const ended = await endMeetingInDb(meeting.id);
 
     // The database is authoritative. The socket event is a best-effort
     // immediate notification; clients also detect endAt through roster polling.
