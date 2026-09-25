@@ -44,6 +44,7 @@ interface MeetingSummary {
   scheduledAt: string | null;
   title: string | null;
   durationMinutes: number | null;
+  hasAnalysis: boolean;
 }
 
 /** Reads the intent set by the landing page, checking the URL first (the
@@ -80,6 +81,10 @@ export default function DashboardPage() {
   const [joining, setJoining] = useState(false);
   const [meetings, setMeetings] = useState<MeetingSummary[]>([]);
   const [meetingsLoading, setMeetingsLoading] = useState(true);
+  const PAGE_SIZE_OPTIONS = [4, 8, 16, 24] as const;
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>(8);
+  const [totalCount, setTotalCount] = useState(0);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleTitle, setScheduleTitle] = useState("");
   const [scheduleDateTime, setScheduleDateTime] = useState("");
@@ -131,17 +136,48 @@ export default function DashboardPage() {
     setShowEmailSuggestions(false);
   };
 
-  const loadMeetings = async () => {
+  const loadMeetings = async (forPage: number, forPageSize: number) => {
+    setMeetingsLoading(true);
     try {
-      const res = await fetch("/api/rooms", { headers: authHeaders() });
+      const res = await fetch(`/api/rooms?page=${forPage}&pageSize=${forPageSize}`, { headers: authHeaders() });
       if (res.ok) {
         const data = await res.json();
         setMeetings(data.meetings);
+        setTotalCount(typeof data.totalCount === "number" ? data.totalCount : 0);
       }
     } finally {
       setMeetingsLoading(false);
     }
   };
+
+  // Re-fetches on page/pageSize changes only — the very first load is
+  // already handled by the auth-guard effect further down (it needs to
+  // run only once auth is confirmed, which this effect doesn't otherwise
+  // know about), so this skips its own first run to avoid double-fetching
+  // the same page on mount.
+  //
+  // The setTimeout(...,0) isn't a real delay — it defers the call outside
+  // this effect's own synchronous execution. loadMeetings sets
+  // meetingsLoading(true) as its first line, before any await, and
+  // calling it directly here would make that setState reachable
+  // synchronously from the effect body, which React's own rules
+  // (react-hooks/set-state-in-effect) flag as a real problem — a setState
+  // during the render/effect pass can trigger a cascading extra render.
+  // The deferral moves that same setState call to its own macrotask,
+  // clearly outside the effect pass, without changing loadMeetings itself
+  // or its behavior for its other callers (the initial load, and the
+  // post-create/schedule reloads).
+  const skippedFirstPageEffect = useRef(false);
+  useEffect(() => {
+    if (!skippedFirstPageEffect.current) {
+      skippedFirstPageEffect.current = true;
+      return;
+    }
+    if (checkingAuth || !user) return;
+    const id = setTimeout(() => void loadMeetings(page, pageSize), 0);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, pageSize]);
 
   const handleCreateRoom = async () => {
     setCreating(true);
@@ -203,7 +239,8 @@ export default function DashboardPage() {
       setScheduleEmails("");
       setDurationEnabled(false);
       setScheduleDuration(60);
-      await loadMeetings();
+      setPage(1);
+      await loadMeetings(1, pageSize);
     } catch {
       toast.error("Couldn't reach the server. Check your connection and try again.");
     } finally {
@@ -244,7 +281,7 @@ export default function DashboardPage() {
 
       setUser(authedUser);
       setCheckingAuth(false);
-      await loadMeetings();
+      await loadMeetings(page, pageSize);
 
       const intent = consumeIntent();
       if (intent === "join") {
@@ -359,7 +396,29 @@ export default function DashboardPage() {
         </div>
 
         <div className="mt-10">
-          <h3 className="text-sm font-semibold text-muted">Recent meetings</h3>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-muted">Recent meetings</h3>
+            {totalCount > 0 && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-muted">Show</span>
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <button
+                    key={size}
+                    onClick={() => {
+                      if (size === pageSize) return;
+                      setPageSize(size);
+                      setPage(1);
+                    }}
+                    className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${
+                      size === pageSize ? "bg-accent text-white" : "text-muted hover:bg-surface2 hover:text-fg"
+                    }`}
+                  >
+                    {size}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           {meetingsLoading ? (
             <div className="mt-3">
               <SkeletonRows count={3} />
@@ -370,28 +429,61 @@ export default function DashboardPage() {
               <p className="mt-2 text-sm text-muted">No meetings yet — create your first room above.</p>
             </div>
           ) : (
-            <ul className="mt-3 divide-y divide-edge rounded-xl border border-edge bg-surface">
-              {meetings.map((m) => (
-                <li key={m.id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
-                  <div className="min-w-0">
-                    <p className="truncate font-medium">{m.title || m.token}</p>
-                    <p className="text-muted">
-                      {m.scheduledAt ? `Scheduled for ${new Date(m.scheduledAt).toLocaleString()}` : `${m.isHost ? "You hosted" : "You joined"} · ${m.participantCount} participant${m.participantCount === 1 ? "" : "s"}`}{m.endAt ? " · ended" : ""}
-                    </p>
-                  </div>
-                  {m.endAt ? (
-                    <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-muted">Ended</span>
-                  ) : m.scheduledAt && new Date(m.scheduledAt).getTime() > now ? (
-                    <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-accent">Scheduled</span>
-                  ) : (
+            <>
+              <ul className="mt-3 divide-y divide-edge rounded-xl border border-edge bg-surface">
+                {meetings.map((m) => (
+                  <li key={m.id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">{m.title || m.token}</p>
+                      <p className="text-muted">
+                        {m.scheduledAt ? `Scheduled for ${new Date(m.scheduledAt).toLocaleString()}` : `${m.isHost ? "You hosted" : "You joined"} · ${m.participantCount} participant${m.participantCount === 1 ? "" : "s"}`}{m.endAt ? " · ended" : ""}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {m.endAt ? (
+                        <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-muted">Ended</span>
+                      ) : m.scheduledAt && new Date(m.scheduledAt).getTime() > now ? (
+                        <span className="shrink-0 rounded-lg border border-edge bg-surface2 px-3 py-1.5 text-xs font-semibold text-accent">Scheduled</span>
+                      ) : (
+                        <button
+                          onClick={() => router.push(`/room/${m.token}`)}
+                          className="shrink-0 rounded-lg border border-edge px-3 py-1.5 text-xs font-semibold transition-colors hover:border-accent hover:text-accent"
+                        >Rejoin</button>
+                      )}
+                      {m.hasAnalysis && m.isHost && (
+                        <button
+                          onClick={() => router.push(`/meeting-report/${m.token}`)}
+                          className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-white transition-opacity hover:opacity-90"
+                        >View report</button>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              {totalCount > pageSize && (
+                <div className="mt-3 flex items-center justify-between text-xs text-muted">
+                  <span>
+                    Page {page} of {Math.max(1, Math.ceil(totalCount / pageSize))} · {totalCount} meeting{totalCount === 1 ? "" : "s"}
+                  </span>
+                  <div className="flex items-center gap-2">
                     <button
-                      onClick={() => router.push(`/room/${m.token}`)}
-                      className="shrink-0 rounded-lg border border-edge px-3 py-1.5 text-xs font-semibold transition-colors hover:border-accent hover:text-accent"
-                    >Rejoin</button>
-                  )}
-                </li>
-              ))}
-            </ul>
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                      disabled={page <= 1}
+                      className="rounded-md border border-edge px-3 py-1.5 font-medium transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-edge disabled:hover:text-muted"
+                    >
+                      Previous
+                    </button>
+                    <button
+                      onClick={() => setPage((p) => (p * pageSize < totalCount ? p + 1 : p))}
+                      disabled={page * pageSize >= totalCount}
+                      className="rounded-md border border-edge px-3 py-1.5 font-medium transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-edge disabled:hover:text-muted"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
 

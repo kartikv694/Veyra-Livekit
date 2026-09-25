@@ -62,21 +62,44 @@ export async function POST(req: NextRequest) {
 /**
  * GET /api/rooms
  *
+ * Query params (both optional):
+ *   pageSize  — one of 4, 8, 16, 24. Defaults to 8; anything else falls
+ *               back to the default rather than erroring, so a stale or
+ *               tampered value never breaks the dashboard.
+ *   page      — 1-based. Defaults to 1; clamped to 1 if not a positive
+ *               integer.
+ *
  * Responses:
- *   200  { meetings: [{ id, token, link, createdAt, endAt, isHost, participantCount }] }
+ *   200  { meetings: [{ id, token, link, createdAt, endAt, isHost, participantCount, hasAnalysis }],
+ *          page, pageSize, totalCount }
  *   401  { error }
  */
+const ALLOWED_PAGE_SIZES = [4, 8, 16, 24];
+const DEFAULT_PAGE_SIZE = 8;
+
 export async function GET(req: NextRequest) {
   const auth = requireAuth(req);
   if (!auth) return unauthorized();
 
-  const meetings = await prisma.meeting.findMany({
-    where: {
-      OR: [{ hostId: auth.sub }, { participants: { some: { userId: auth.sub } } }],
-    },
-    orderBy: { createdAt: "desc" },
-    include: { _count: { select: { participants: true } } },
-  });
+  const requestedPageSize = Number(req.nextUrl.searchParams.get("pageSize"));
+  const pageSize = ALLOWED_PAGE_SIZES.includes(requestedPageSize) ? requestedPageSize : DEFAULT_PAGE_SIZE;
+  const requestedPage = Number(req.nextUrl.searchParams.get("page"));
+  const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+
+  const where = {
+    OR: [{ hostId: auth.sub }, { participants: { some: { userId: auth.sub } } }],
+  };
+
+  const [meetings, totalCount] = await Promise.all([
+    prisma.meeting.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      include: { _count: { select: { participants: true, participantAnalyses: true } } },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    prisma.meeting.count({ where }),
+  ]);
 
   // The generated Prisma client in older checkouts may not know about
   // scheduledAt/title/durationMinutes yet, so keep the compatibility query
@@ -103,6 +126,10 @@ export async function GET(req: NextRequest) {
       durationMinutes: extraById.get(m.id)?.durationMinutes ?? null,
       isHost: m.hostId === auth.sub,
       participantCount: m._count.participants,
+      hasAnalysis: m._count.participantAnalyses > 0,
     })),
+    page,
+    pageSize,
+    totalCount,
   });
 }

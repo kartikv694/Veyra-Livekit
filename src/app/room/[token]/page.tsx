@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   Ban,
+  Bot,
   Captions,
   Check,
   Copy,
@@ -1919,20 +1920,28 @@ export default function RoomPage() {
   }, [autoEndAt, joined, durationWarningShown, myRow?.isHost]);
 
   const others = participants.filter((participant) => participant.userId !== me?.id && !participant.leftAt);
-  // A separate list from `others` on purpose — this feeds ONLY the tile-
-  // rendering loops below, not totalTiles/activeParticipantCount (both
-  // still plain `others.length + 1`), which stay human-only: the visible
-  // "N participants" badge and the solo-view/layout-mode decision should
-  // both reflect real attendees, not the AI monitor. The agent still gets
-  // its own rendered tile via this list — it's additive to the layout,
-  // never a factor in choosing which layout to show.
+  // The AI agent is deliberately NOT part of the video grid at all — see
+  // the small header badge further down instead (agentPeer, used there).
+  // A full participant-sized tile for something that never has a camera
+  // or mic reads as a broken/empty tile more than a helpful presence
+  // indicator — the badge is the Google Meet "Gemini" pattern this is
+  // modeled on: a small, unobtrusive marker, not a seat in the grid.
   const agentPeer = peers.find((p) => p.isAgent);
-  const othersForTiles: ParticipantRow[] = agentPeer
-    ? [...others, { userId: agentPeer.userId, name: agentPeer.name, isHost: false, isMuted: false, isCameraOff: false, leftAt: null }]
-    : others;
   const liveByUserId = useMemo(() => new Map(peers.map((peer) => [peer.userId, peer])), [peers]);
-  const totalTiles = others.length + 1;
-  const spotlightFeatured = others.find((p) => p.isHost) ?? others[0] ?? null;
+  // Deliberately NOT the same as `others` — a participant's DB row only
+  // ever gets leftAt set by an explicit action (clicking Leave, the host
+  // ending the meeting, a fresh roster poll eventually catching up).
+  // Someone who just closes their tab or loses their connection leaves
+  // no such signal behind, so their row can sit there looking "active"
+  // indefinitely even though they're not actually connected to anything
+  // anymore. Every visible/counted use of "who's here" below is filtered
+  // through this — an entry only counts if it ALSO has a live LiveKit
+  // peer — specifically to stop a stale DB row from rendering a tile, or
+  // counting toward the participant badge, for someone who's actually
+  // long gone.
+  const liveOthers = others.filter((p) => liveByUserId.has(p.userId));
+  const totalTiles = liveOthers.length + 1;
+  const spotlightFeatured = liveOthers.find((p) => p.isHost) ?? liveOthers[0] ?? null;
   // Whoever's screen should be the big tile right now — either mine, or
   // the first other participant currently sharing theirs. Meet only ever
   // shows one screen share at a time in practice, so "first" is fine.
@@ -1945,7 +1954,7 @@ export default function RoomPage() {
       ? (liveByUserId.get(remotePresenter.userId)?.screenStream ?? null)
       : null;
   const presentingName = sharingScreen ? "Your screen" : remotePresenter ? `${remotePresenter.name}'s screen` : "";
-  const activeParticipantCount = others.length + 1;
+  const activeParticipantCount = liveOthers.length + 1;
 
   if (checkingAuth || !me) {
     return <LoadingScreen message="Loading..." />;
@@ -2046,6 +2055,15 @@ export default function RoomPage() {
               </button>
             </div>
           )}
+          {agentPeer && (
+            <div
+              className="flex items-center gap-1.5 rounded-full bg-white/[0.06] px-3 py-1.5"
+              title="Veyra's AI meeting assistant is present, silently analyzing the conversation"
+            >
+              <Bot size={14} className="text-accent" />
+              <span className="text-xs font-medium text-accent">Veyra AI</span>
+            </div>
+          )}
           <div className="flex items-center gap-2 rounded-full bg-white/[0.06] pl-1.5 pr-2.5 py-1">
             <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-xs font-semibold">{initials(me.name ?? me.email)}</div>
             <span className="text-xs font-medium text-white/75">{activeParticipantCount}</span>
@@ -2078,7 +2096,7 @@ export default function RoomPage() {
                   handRaised={handRaised}
                 />
               </div>
-              {othersForTiles.map((participant) => {
+              {liveOthers.map((participant) => {
                 const live = liveByUserId.get(participant.userId);
                 return (
                   <div key={participant.userId} className="aspect-video h-full shrink-0 sm:aspect-auto sm:w-full sm:min-h-[110px] sm:flex-1">
@@ -2164,7 +2182,7 @@ export default function RoomPage() {
                   />
                 </div>
               )}
-              {othersForTiles
+              {liveOthers
                 .filter((participant) => participant.userId !== spotlightFeatured?.userId)
                 .map((participant) => {
                   const live = liveByUserId.get(participant.userId);
@@ -2202,7 +2220,7 @@ export default function RoomPage() {
                 />
               ),
             };
-            const otherTiles = othersForTiles.map((participant) => {
+            const otherTiles = liveOthers.map((participant) => {
               const live = liveByUserId.get(participant.userId);
               return {
                 key: String(participant.userId),

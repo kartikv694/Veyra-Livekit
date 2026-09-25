@@ -8,14 +8,18 @@
  * meeting ends, so this can legitimately return an empty list for a while
  * even for a meeting that's genuinely over — the meeting-ended screen
  * polls this for exactly that reason (see its own comment), not because a
- * first empty response means analysis will never arrive.
+ * first empty response means analysis will never arrive. The dashboard's
+ * "View report" link (see /meeting-report/[token]) only appears once the
+ * dashboard's own list already knows analysis rows exist for a meeting,
+ * so that page fetches this once and doesn't need to poll.
  *
  * Host-only specifically because this is analysis *of* the other
  * participants — not something they'd see about themselves, same
  * reasoning as why only the host sees things like the invite list.
  *
  * Responses:
- *   200  { analysis: { userId, name, communication, fluency, topicKnowledge,
+ *   200  { meeting: { title, createdAt, endAt },
+ *          analysis: { userId, name, communication, fluency, topicKnowledge,
  *          teamworkListening, leadershipInitiative,
  *          confidenceProfessionalism, summary }[] }
  *   401  { error }
@@ -57,5 +61,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ toke
     },
   });
 
-  return NextResponse.json({ analysis: rows });
+  return NextResponse.json({
+    meeting: { title: meeting.title, createdAt: meeting.createdAt, endAt: meeting.endAt },
+    analysis: rows,
+  });
 }
